@@ -4,16 +4,20 @@ set -euo pipefail
 APP=/opt/funding-scanner
 DATA=/var/lib/funding-scanner
 
-if ! id scanner >/dev/null 2>&1; then
+if [ ! -f /etc/funding-scanner.provisioned ]; then
   apt-get update -y
   DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv sqlite3 ufw
-  useradd --system --home "$DATA" --shell /usr/sbin/nologin scanner
   ufw allow OpenSSH && ufw --force enable
   if [ ! -f /swapfile ]; then
     fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
     echo '/swapfile none swap sw 0 0' >> /etc/fstab
   fi
+  touch /etc/funding-scanner.provisioned
 fi
+
+getent group scanner >/dev/null || groupadd --system scanner
+id scanner >/dev/null 2>&1 || useradd --system --gid scanner --home "$DATA" --shell /usr/sbin/nologin scanner
+usermod -g scanner scanner
 
 mkdir -p "$APP" "$DATA"
 rm -rf "$APP/src" "$APP/scripts"
@@ -32,6 +36,7 @@ Wants=network-online.target
 
 [Service]
 User=scanner
+Group=scanner
 WorkingDirectory=$APP
 EnvironmentFile=$DATA/env
 ExecStart=$APP/.venv/bin/python -m scripts.worker
