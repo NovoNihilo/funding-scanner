@@ -10,7 +10,7 @@ VENUES = ("variational", "hyperliquid", "lighter")
 ALIASES = {"WTI": "CL", "BRENTOIL": "BZ", "XCU": "COPPER"}
 _PREFIXES = (("1000000", 1e6), ("1M", 1e6), ("1000", 1e3), ("1K", 1e3))
 COLS = ("venue", "symbol", "asset", "multiplier", "market_id", "interval_s", "unit_price",
-        "volume_24h_usd", "asset_class", "flags", "matched")
+        "volume_24h_usd", "asset_class", "flags", "matched", "max_leverage")
 
 
 def normalize_symbol(symbol):
@@ -32,17 +32,17 @@ def normalize_symbol(symbol):
     return ALIASES.get(s, s), mult
 
 
-def _row(venue, symbol, market_id, interval_s, px, vol, asset_class, flags):
+def _row(venue, symbol, market_id, interval_s, px, vol, asset_class, flags, max_lev=None):
     asset, mult = normalize_symbol(symbol)
     return dict(venue=venue, symbol=symbol, asset=asset, multiplier=mult, market_id=str(market_id),
                 interval_s=interval_s, unit_price=(px / mult) if px else None,
-                volume_24h_usd=vol, asset_class=asset_class, flags=flags)
+                volume_24h_usd=vol, asset_class=asset_class, flags=flags, max_leverage=max_lev)
 
 
 def fetch_hyperliquid():
     universe, ctxs = hl.meta_and_asset_ctxs()
     return [_row("hyperliquid", u["name"], u["name"], 3600, float(c.get("markPx") or 0),
-                 float(c.get("dayNtlVlm") or 0), "crypto", [])
+                 float(c.get("dayNtlVlm") or 0), "crypto", [], u.get("maxLeverage"))
             for u, c in zip(universe, ctxs) if not u.get("isDelisted")]
 
 
@@ -65,11 +65,13 @@ def fetch_lighter():
         field_mult = float(d.get("multiplier") or 1)
         if abs(field_mult - 1) > 1e-9:
             flags.append(f"LTMULT={field_mult:g}")
+        imf = float(d.get("min_initial_margin_fraction") or 0)
+        max_lev = round(10000 / imf, 2) if imf > 0 else None  # IMF assumed in basis points; verified below
         tradfi = bool(cfg.get("trading_hours")) or fpm < 100
         px = float(d.get("mark_price") or d.get("last_trade_price") or 0)
         out.append(_row("lighter", d["symbol"], d["market_id"], 3600, px,
                         float(d.get("daily_quote_token_volume") or 0),
-                        "tradfi" if tradfi else "crypto", flags))
+                        "tradfi" if tradfi else "crypto", flags, max_lev))
     return out
 
 
@@ -81,7 +83,7 @@ def fetch_variational():
         f = x.get("funding")
         out.append(_row("variational", x["ticker"], x["ticker"], (f or {}).get("interval_seconds"),
                         float(x.get("mark_price") or 0), float(x.get("volume_24h") or 0),
-                        None, [] if f else ["NO_FUNDING"]))
+                        None, [] if f else ["NO_FUNDING"], None))  # max leverage not published
     return out
 
 

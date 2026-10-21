@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS markets (
     matched INTEGER NOT NULL DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
     updated_at INTEGER NOT NULL,
+    max_leverage REAL,
     PRIMARY KEY (venue, symbol)
 );
 CREATE INDEX IF NOT EXISTS ix_markets_asset ON markets(asset);
@@ -73,6 +74,8 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 """
 
+MIGRATIONS = [("markets", "max_leverage", "REAL")]
+
 
 def connect(path=None):
     path = path or DB_PATH
@@ -81,5 +84,10 @@ def connect(path=None):
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.executescript(SCHEMA)
+    for table, col, typ in MIGRATIONS:
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if col not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
     return conn
