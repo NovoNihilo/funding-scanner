@@ -22,6 +22,55 @@ CREATE TABLE IF NOT EXISTS markets (
     PRIMARY KEY (venue, symbol)
 );
 CREATE INDEX IF NOT EXISTS ix_markets_asset ON markets(asset);
+
+-- rate: signed fraction of notional for one settlement interval; positive = longs pay shorts
+CREATE TABLE IF NOT EXISTS settlements (
+    venue TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    interval_s INTEGER NOT NULL,
+    rate REAL NOT NULL,
+    rate_err REAL,
+    quality TEXT NOT NULL,
+    source TEXT NOT NULL,
+    raw TEXT,
+    inserted_at INTEGER NOT NULL,
+    PRIMARY KEY (venue, symbol, ts)
+);
+
+CREATE TABLE IF NOT EXISTS var_snapshots (
+    symbol TEXT NOT NULL,
+    captured_at INTEGER NOT NULL,
+    next_ts INTEGER,
+    interval_s INTEGER,
+    interval_rate REAL,
+    annualized_rate REAL,
+    mark_price REAL,
+    bid_1k REAL,
+    ask_1k REAL,
+    bid_100k REAL,
+    ask_100k REAL,
+    quotes_updated_at TEXT,
+    PRIMARY KEY (symbol, captured_at)
+);
+
+CREATE TABLE IF NOT EXISTS sync_state (
+    venue TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    last_ts INTEGER,
+    last_attempt INTEGER,
+    last_error TEXT,
+    PRIMARY KEY (venue, symbol)
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    ok INTEGER,
+    detail TEXT
+);
 """
 
 
