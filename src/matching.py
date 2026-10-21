@@ -1,0 +1,144 @@
+"""Cross-venue asset matching: normalize symbols, then validate by per-unit price agreement."""
+import re
+import time
+from statistics import median
+
+from src.config import PRICE_TOL
+from src.venues import hyperliquid as hl, lighter as lt, variational as va
+
+VENUES = ("variational", "hyperliquid", "lighter")
+ALIASES = {"WTI": "CL", "BRENTOIL": "BZ", "XCU": "COPPER"}
+_PREFIXES = (("1000000", 1e6), ("1M", 1e6), ("1000", 1e3), ("1K", 1e3))
+COLS = ("venue", "symbol", "asset", "multiplier", "market_id", "interval_s", "unit_price",
+        "volume_24h_usd", "asset_class", "flags", "matched")
+
+
+def normalize_symbol(symbol):
+    """Return (asset, multiplier); multiplier = underlying units per quoted unit."""
+    s = symbol.strip()
+    for suffix in ("-PERP", "-USD", "/USDC"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+    mult = 1.0
+    if re.fullmatch(r"k[A-Z0-9]{2,}", s):
+        s, mult = s[1:], 1e3
+    else:
+        for prefix, m in _PREFIXES:
+            rest = s[len(prefix):]
+            if s.startswith(prefix) and len(rest) >= 2 and rest[0].isalpha():
+                s, mult = rest, m
+                break
+    s = s.upper()
+    return ALIASES.get(s, s), mult
+
+
+def _row(venue, symbol, market_id, interval_s, px, vol, asset_class, flags):
+    asset, mult = normalize_symbol(symbol)
+    return dict(venue=venue, symbol=symbol, asset=asset, multiplier=mult, market_id=str(market_id),
+                interval_s=interval_s, unit_price=(px / mult) if px else None,
+                volume_24h_usd=vol, asset_class=asset_class, flags=flags)
+
+
+def fetch_hyperliquid():
+    universe, ctxs = hl.meta_and_asset_ctxs()
+    return [_row("hyperliquid", u["name"], u["name"], 3600, float(c.get("markPx") or 0),
+                 float(c.get("dayNtlVlm") or 0), "crypto", [])
+            for u, c in zip(universe, ctxs) if not u.get("isDelisted")]
+
+
+def fetch_lighter():
+    out = []
+    for d in lt.order_book_details("perp"):
+        if d.get("market_type") != "perp" or d.get("status") != "active":
+            continue
+        cfg = d.get("market_config") or {}
+        fpm = int(d.get("funding_premium_multiplier") or 100)
+        flags = []
+        if cfg.get("hidden"):
+            flags.append("HIDDEN")
+        if cfg.get("force_reduce_only"):
+            flags.append("REDUCE_ONLY")
+        if fpm != 100:
+            flags.append(f"FPM={fpm}")
+        if fpm <= 1:
+            flags.append("PREIPO")
+        field_mult = float(d.get("multiplier") or 1)
+        if abs(field_mult - 1) > 1e-9:
+            flags.append(f"LTMULT={field_mult:g}")
+        tradfi = bool(cfg.get("trading_hours")) or fpm < 100
+        px = float(d.get("mark_price") or d.get("last_trade_price") or 0)
+        out.append(_row("lighter", d["symbol"], d["market_id"], 3600, px,
+                        float(d.get("daily_quote_token_volume") or 0),
+                        "tradfi" if tradfi else "crypto", flags))
+    return out
+
+
+def fetch_variational():
+    out = []
+    for x in va.stats()["listings"]:
+        if x.get("contract_type") != "perpetual":
+            continue
+        f = x.get("funding")
+        out.append(_row("variational", x["ticker"], x["ticker"], (f or {}).get("interval_seconds"),
+                        float(x.get("mark_price") or 0), float(x.get("volume_24h") or 0),
+                        None, [] if f else ["NO_FUNDING"]))
+    return out
+
+
+def validate(rows, tol=PRICE_TOL):
+    """matched=1 when >=2 venues agree on per-unit price within tol."""
+    groups = {}
+    for r in rows:
+        r["matched"] = 0
+        groups.setdefault(r["asset"], []).append(r)
+    for grp in groups.values():
+        known = {r["asset_class"] for r in grp if r["asset_class"]}
+        cls = "tradfi" if "tradfi" in known else ("crypto" if known else "unknown")
+        for r in grp:
+            if r["asset_class"] is None:
+                r["asset_class"] = cls
+        if len({r["venue"] for r in grp}) < 2:
+            continue
+        for r in grp:
+            if not r["unit_price"]:
+                r["flags"].append("NO_PRICE")
+        priced = [r for r in grp if r["unit_price"]]
+        if len(priced) < 2:
+            continue
+        if len(priced) == 2:
+            a, b = priced
+            good = priced if abs(a["unit_price"] / b["unit_price"] - 1) <= tol else []
+        else:
+            ref = median(r["unit_price"] for r in priced)
+            good = [r for r in priced if abs(r["unit_price"] / ref - 1) <= tol]
+        if len({r["venue"] for r in good}) < 2:
+            good = []
+        good_ids = {id(r) for r in good}
+        for r in priced:
+            if id(r) in good_ids:
+                r["matched"] = 1
+            else:
+                r["flags"].append("PRICE_MISMATCH")
+    return rows
+
+
+def save(conn, rows, venues):
+    now = int(time.time())
+    params = [tuple(",".join(r["flags"]) if c == "flags" else r.get(c) for c in COLS) + (now,)
+              for r in rows]
+    sql = (f"INSERT INTO markets ({', '.join(COLS)}, active, updated_at) "
+           f"VALUES ({', '.join('?' * len(COLS))}, 1, ?) "
+           "ON CONFLICT(venue, symbol) DO UPDATE SET "
+           + ", ".join(f"{c}=excluded.{c}" for c in COLS[2:])
+           + ", active=1, updated_at=excluded.updated_at")
+    with conn:
+        for v in venues:
+            conn.execute("UPDATE markets SET active=0 WHERE venue=?", (v,))
+        conn.executemany(sql, params)
+
+
+def refresh_markets(conn):
+    rows = fetch_variational() + fetch_hyperliquid() + fetch_lighter()
+    validate(rows)
+    save(conn, rows, VENUES)
+    return rows
