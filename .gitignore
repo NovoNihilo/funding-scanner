@@ -5,3 +5,5 @@ data/
 *.db
 deploy/server.txt
 deploy/release.tar
+deploy/server.txt
+deploy/release.tar
