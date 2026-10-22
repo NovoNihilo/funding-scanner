@@ -6,6 +6,7 @@ from src.signals import (apy_numbers, build_periods, cohort_for, evaluate_all, l
                          mark_anomalies)
 
 H = 3600
+PAIR = "AAA|hyperliquid:AAA>lighter:AAA"
 
 
 def _hourly(start, n, rate, quality="CONFIRMED"):
@@ -85,13 +86,17 @@ def _seed(conn, now, short_rate, long_rate, hours=60, rt_cost=0.0002, p99=0.04, 
                      (t, long_rate))
 
 
+def _row(conn, cols="*"):
+    return conn.execute(f"SELECT {cols} FROM signals WHERE pair_id=?", (PAIR,)).fetchone()
+
+
 def test_end_to_end_qualifies_after_24h_and_reverse_does_not():
     conn = connect(":memory:")
     now = 1000 * H
     _seed(conn, now, short_rate=3e-5, long_rate=0.0)  # net 3e-5/h -> 26.3% APR -> 13.1% capital APY
     res = evaluate_all(conn, now)
     st = {r["pair_id"]: r for r in conn.execute("SELECT * FROM signals")}
-    good, rev = st["AAA|hyperliquid>lighter"], st["AAA|lighter>hyperliquid"]
+    good, rev = st[PAIR], st["AAA|lighter:AAA>hyperliquid:AAA"]
     assert good["status"] == "QUALIFIED" and good["cohort"] == "ESTABLISHED"
     assert abs(good["apy_1x"] - 3e-5 * 8760 / 2) < 1e-9 and good["max_lev"] == 5.0
     assert rev["status"] == "MONITORING"
@@ -103,7 +108,7 @@ def test_below_min_apy_is_not_qualified():
     now = 1000 * H
     _seed(conn, now, short_rate=1e-5, long_rate=0.0)  # 8.76% APR -> 4.38% capital APY < 5%
     evaluate_all(conn, now)
-    row = conn.execute("SELECT status, reasons FROM signals WHERE pair_id='AAA|hyperliquid>lighter'").fetchone()
+    row = _row(conn, "status, reasons")
     assert row["status"] == "MONITORING" and "APY 1x" in row["reasons"]
 
 
@@ -114,7 +119,7 @@ def test_qualified_then_failing_gate_is_suspended():
     evaluate_all(conn, now)
     # data then goes stale (no new settlements) for 4 hours
     evaluate_all(conn, now + 4 * H)
-    row = conn.execute("SELECT status, reasons FROM signals WHERE pair_id='AAA|hyperliquid>lighter'").fetchone()
+    row = _row(conn, "status, reasons")
     assert row["status"] == "SUSPENDED" and "stale" in row["reasons"]
 
 
@@ -124,7 +129,7 @@ def test_slow_payback_is_reported_not_blocking():
     # 3e-5/h net on $1k = $0.03/h; taker round trip 2 x 0.5% = $10 -> ~333h; maker 2 x 0.01% = $0.20 -> ~6.7h
     _seed(conn, now, short_rate=3e-5, long_rate=0.0, rt_cost=0.005, rt_maker=0.0001)
     evaluate_all(conn, now)
-    row = conn.execute("SELECT status, metrics FROM signals WHERE pair_id='AAA|hyperliquid>lighter'").fetchone()
+    row = _row(conn, "status, metrics")
     c = json.loads(row["metrics"])["costs"]["1000"]
     assert row["status"] == "QUALIFIED"
     assert abs(c["payback_h"] - 0.01 / 3e-5) < 1e-6 and c["payback_tier"] == "SLOW"
@@ -141,7 +146,7 @@ def test_missing_costs_do_not_block_and_candidates_returned():
     assert ("hyperliquid", "AAA", "AAA") in res["candidates"] and ("lighter", "AAA", "AAA") in res["candidates"]
     assert conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 0  # persist=False writes nothing
     evaluate_all(conn, now)  # costs are informational: the funding signal still qualifies
-    row = conn.execute("SELECT status, metrics FROM signals WHERE pair_id='AAA|hyperliquid>lighter'").fetchone()
+    row = _row(conn, "status, metrics")
     assert row["status"] == "QUALIFIED" and json.loads(row["metrics"])["costs"]["1000"]["status"] == "MISSING"
 
 
@@ -150,7 +155,23 @@ def test_stress_test_caps_leverage_range():
     now = 1000 * H
     _seed(conn, now, short_rate=3e-5, long_rate=0.0, p99=0.30)  # 37.5% buffered move, 20x venues -> 2x
     evaluate_all(conn, now)
-    row = conn.execute("SELECT status, max_lev, apy_1x, apy_max FROM signals "
-                       "WHERE pair_id='AAA|hyperliquid>lighter'").fetchone()
+    row = _row(conn, "status, max_lev, apy_1x, apy_max")
     assert row["status"] == "QUALIFIED" and row["max_lev"] == 2.0
     assert abs(row["apy_max"] - 2 * row["apy_1x"]) < 1e-12
+
+
+def test_multiple_markets_per_venue_get_distinct_pairs_and_stale_pairs_are_removed():
+    conn = connect(":memory:")
+    now = 1000 * H
+    _seed(conn, now, short_rate=3e-5, long_rate=0.0)
+    conn.execute("INSERT INTO markets (venue, symbol, asset, market_id, interval_s, asset_class, flags, matched,"
+                 " active, updated_at, max_leverage) VALUES ('hyperliquid','xyz:AAA','AAA','xyz:AAA',3600,'tradfi',"
+                 "'HIP3,DEX=xyz',1,1,0,10)")
+    res = evaluate_all(conn, now)
+    ids = {r[0] for r in conn.execute("SELECT pair_id FROM signals")}
+    assert res["pairs"] == 4 and "AAA|hyperliquid:xyz:AAA>lighter:AAA" in ids
+    flags = conn.execute("SELECT flags FROM signals WHERE pair_id='AAA|hyperliquid:xyz:AAA>lighter:AAA'").fetchone()[0]
+    assert "DIVIDEND_UNKNOWN" in flags
+    conn.execute("UPDATE markets SET active=0 WHERE symbol='xyz:AAA'")
+    res = evaluate_all(conn, now + H)
+    assert res["removed"] == 2 and conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 2

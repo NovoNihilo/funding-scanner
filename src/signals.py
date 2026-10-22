@@ -234,8 +234,9 @@ def evaluate_pair(lg, sh, long_r, short_r, now, lg_costs=None, sh_costs=None, p9
         flags.add(f"DIV_EXCLUDED={div_n}")
     if anom_n:
         flags.add(f"ANOMALY_EXCLUDED={anom_n}")
-    if "tradfi" in (lg["asset_class"], sh["asset_class"]) and "lighter" in (lg["venue"], sh["venue"]):
-        flags.add("DIVIDEND_UNKNOWN")
+    undocumented = [m for m in (lg, sh) if m["venue"] == "lighter" or "HIP3" in (m["flags"] or "")]
+    if "tradfi" in (lg["asset_class"], sh["asset_class"]) and undocumented:
+        flags.add("DIVIDEND_UNKNOWN")  # Lighter and HIP-3 deployers publish no dividend procedure
     for m in (lg, sh):
         for f in (m["flags"] or "").split(","):
             if f in BLOCKING_FLAGS:
@@ -359,7 +360,7 @@ def evaluate_all(conn, now=None, persist=True):
         for lg, sh in permutations(ms, 2):
             if lg["venue"] == sh["venue"]:
                 continue
-            pair_id = f"{asset}|{lg['venue']}>{sh['venue']}"
+            pair_id = f"{asset}|{lg['venue']}:{lg['symbol']}>{sh['venue']}:{sh['symbol']}"
             sig = evaluate_pair(lg, sh, rates(lg), rates(sh), now, costs.get((lg["venue"], lg["symbol"])),
                                 costs.get((sh["venue"], sh["symbol"])), p99s.get(asset))
             prev = prev_rows.get(pair_id)
@@ -383,10 +384,13 @@ def evaluate_all(conn, now=None, persist=True):
                          sig["apy_max"], sig["max_lev"], json.dumps(sig["metrics"]), ",".join(sig["flags"]),
                          json.dumps(sig["reasons"]), now))
     summary = {"pairs": len(rows), "events": len(events), "status": dict(Counter(r[6] for r in rows)),
+               "removed": len(set(prev_rows) - {r[0] for r in rows}),
                "candidates": sorted(candidates)}
     if not persist:
         return summary
+    stale = [(pid,) for pid in set(prev_rows) - {r[0] for r in rows}]  # delisted / unmatched / renamed pairs
     with conn:
+        conn.executemany("DELETE FROM signals WHERE pair_id=?", stale)
         conn.executemany("INSERT OR REPLACE INTO signals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         conn.executemany("INSERT INTO signal_events (pair_id, ts, event, from_status, to_status, detail) "
                          "VALUES (?,?,?,?,?,?)", events)

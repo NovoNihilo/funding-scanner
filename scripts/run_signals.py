@@ -31,6 +31,11 @@ def eta(c):
     return f"{f(t)}/{f(m)}"
 
 
+def vl(venue, symbol):
+    """Short venue label: H, L, V; HIP-3 markets show their builder dex, e.g. H(xyz)."""
+    return venue[:1].upper() + (f"({symbol.split(':')[0]})" if ":" in symbol else "")
+
+
 def rank_key(r):
     v = json.loads(r["metrics"]).get("rank_net_hold_usd")
     return (v is None, -(v or 0))
@@ -48,10 +53,14 @@ def main():
     res = evaluate_all(conn, asof)
     print(f"as of {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(asof))}  basis={APY_BASIS}  "
           f"min APY 1x={MIN_APY_1X:.0%}  size=${PRIMARY_SIZE:,.0f}/leg  hold={HOLD_HORIZON_H:.0f}h")
-    print(f"pairs={res['pairs']} events={res['events']} status={res['status']}")
+    print(f"pairs={res['pairs']} events={res['events']} removed={res['removed']} status={res['status']}")
+    cls = Counter(r["asset_class"] for r in conn.execute(
+        "SELECT DISTINCT asset, asset_class FROM markets WHERE matched=1 AND active=1"))
+    hip3 = conn.execute("SELECT COUNT(*) FROM markets WHERE matched=1 AND active=1 AND flags LIKE '%HIP3%'").fetchone()[0]
+    print(f"matched assets by class={dict(cls)}  matched HIP-3 markets={hip3}")
 
     rows = conn.execute("SELECT * FROM signals WHERE apy_1x IS NOT NULL").fetchall()
-    head = (f"{'asset':<9}{'pair':<6}{'status':<11}{'cohort':<12}{'age':>4}{'APY1x':>7}  {'range':<15}"
+    head = (f"{'asset':<9}{'pair':<13}{'status':<11}{'cohort':<12}{'age':>4}{'APY1x':>7}  {'range':<15}"
             f"{'cost':>7}{'payback t/m':>13}{'net24':>8}{'net hold':>9}{'basis':>8}  flags / reasons")
     sections = (("QUALIFIED (ranked by expected net over hold)", [r for r in rows if r["status"] == "QUALIFIED"],
                  rank_key),
@@ -68,7 +77,8 @@ def main():
             basis = f"{c['basis_bps']:5.1f}bp" if c.get("status") == "OK" else "n/a"
             flags = [f for f in (r["flags"] or "").split(",") if f and f not in ("ESTIMATED_DATA",)]
             extra = flags + ([] if r["status"] == "QUALIFIED" else json.loads(r["reasons"])[:2])
-            print(f"{r['asset']:<9}{r['long_venue'][:1].upper() + '>' + r['short_venue'][:1].upper():<6}"
+            pair = vl(r["long_venue"], r["long_symbol"]) + ">" + vl(r["short_venue"], r["short_symbol"])
+            print(f"{r['asset']:<9}{pair:<13}"
                   f"{r['status']:<11}{(r['cohort'] or '-'):<12}{r['age_h']:>4.0f}{pct(r['apy_1x']):>7}  {rng:<15}"
                   f"{money(c.get('cost_usd'))}{eta(c):>13}{money(c.get('net24_usd')):>8}"
                   f"{money(c.get('net_hold_usd')):>9}{basis:>8}  {'; '.join(extra)}")

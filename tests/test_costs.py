@@ -58,9 +58,12 @@ def test_refresh_costs_stores_taker_and_maker(monkeypatch):
     monkeypatch.setattr(costs.lt, "order_book_details",
                         lambda f="perp": [{"market_id": 7, "taker_fee": "0.0200", "maker_fee": "0.0040"}])
     conn = connect(":memory:")
-    stats = costs.refresh_costs(conn, [("hyperliquid", "BTC", "BTC"), ("lighter", "BTC", "7")], now=1000)
-    assert stats == {"markets": 2, "errors": 0, "no_depth": 0}
-    r = {x["venue"]: x for x in conn.execute("SELECT * FROM book_costs WHERE size_usd=1000")}
+    stats = costs.refresh_costs(conn, [("hyperliquid", "BTC", "BTC"), ("lighter", "BTC", "7"),
+                                       ("hyperliquid", "xyz:TSLA", "xyz:TSLA")], now=1000)
+    assert stats == {"markets": 3, "errors": 0, "no_depth": 0}
+    hip3 = conn.execute("SELECT * FROM book_costs WHERE symbol='xyz:TSLA' AND size_usd=1000").fetchone()
+    assert abs(hip3["rt_cost"] - (0.0002 + 2 * 0.0009)) < 1e-9 and hip3["flags"] == "HIP3_FEE_EST"
+    r = {x["venue"]: x for x in conn.execute("SELECT * FROM book_costs WHERE size_usd=1000 AND symbol='BTC'")}
     assert abs(r["hyperliquid"]["rt_cost"] - (0.0002 + 2 * 0.00045)) < 1e-9
     assert abs(r["hyperliquid"]["rt_cost_maker"] - 2 * 0.00015) < 1e-12
     assert abs(r["lighter"]["rt_cost"] - (0.0002 + 2 * 0.0002)) < 1e-9  # percent fees converted

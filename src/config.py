@@ -5,6 +5,8 @@ PRICE_TOL = float(os.environ.get("PRICE_TOL", "0.03"))
 BACKFILL_DAYS = float(os.environ.get("BACKFILL_DAYS", "7"))
 VAR_RATE_SOURCE = os.environ.get("VAR_RATE_SOURCE", "pre")  # 'pre' or 'post'; set from timing verdict
 VAR_WINDOW_S = int(os.environ.get("VAR_WINDOW_S", "900"))
+# Hyperliquid HIP-3 builder dexes to include (comma list). Each deployer runs its own oracle: allowlist only trusted ones.
+HIP3_DEXES = [d.strip() for d in os.environ.get("HIP3_DEXES", "xyz").split(",") if d.strip()]
 
 # Signal economics
 MIN_APY_1X = float(os.environ.get("MIN_APY_1X", "0.05"))  # minimum funding APY at 1x
@@ -28,6 +30,7 @@ PAYBACK_OK_H = float(os.environ.get("PAYBACK_OK_H", "72"))
 COST_MAX_AGE_S = int(os.environ.get("COST_MAX_AGE_S", "7200"))  # older cost estimates count as missing
 HL_TAKER_FEE = float(os.environ.get("HL_TAKER_FEE", "0.00045"))  # Hyperliquid base tier taker fee
 HL_MAKER_FEE = float(os.environ.get("HL_MAKER_FEE", "0.00015"))  # Hyperliquid base tier maker fee
+HIP3_FEE_MULT = float(os.environ.get("HIP3_FEE_MULT", "2.0"))  # HIP-3 markets: deployer fee share, ~2x base
 VAR_TAKER_FEE = float(os.environ.get("VAR_TAKER_FEE", "0"))  # Variational Omni charges no trading fee
 VAR_QUOTE_PENALTY = float(os.environ.get("VAR_QUOTE_PENALTY", "1.25"))  # indicative (RFQ) quotes
 VAR_STALE_PENALTY = float(os.environ.get("VAR_STALE_PENALTY", "2.0"))  # quotes older than VAR_STALE_S

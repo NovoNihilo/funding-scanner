@@ -5,13 +5,14 @@ Round-trip cost per market, as a fraction of notional, in two execution styles:
 - maker: resting orders filled at the touch -> 2 x maker fee only (best case; fills are not guaranteed)
 Each leg of a pair is opened and later closed once, so a pair's cost is the sum of both markets' round trips
 plus any adverse cross-venue basis at entry.
-- Hyperliquid and Lighter: executable public order books.
+- Hyperliquid and Lighter: executable public order books. HIP-3 fees vary by deployer (fee scale, growth mode);
+  they are estimated as HIP3_FEE_MULT x the base fee and flagged HIP3_FEE_EST.
 - Variational: indicative RFQ quotes (cached up to 10 min by the venue) -> penalised; no maker option (RFQ only).
 """
 import time
 from datetime import datetime, timezone
 
-from src.config import (COST_SIZES, DEFAULT_STRESS_MOVE, HL_MAKER_FEE, HL_TAKER_FEE, MIN_STRESS_MOVE,
+from src.config import (COST_SIZES, DEFAULT_STRESS_MOVE, HIP3_FEE_MULT, HL_MAKER_FEE, HL_TAKER_FEE, MIN_STRESS_MOVE,
                         PRICE_STATS_DAYS, STRESS_BUFFER, VAR_QUOTE_PENALTY, VAR_STALE_PENALTY, VAR_STALE_S,
                         VAR_TAKER_FEE)
 from src.venues import hyperliquid as hl, lighter as lt
@@ -125,9 +126,13 @@ def refresh_costs(conn, markets, now=None):
                     cost, mid, flags = var_round_trip(snap, size, now)
                     rows.append((venue, symbol, size, cost, mid, 0, ",".join(flags), now, cost))
             else:
+                base_flags = []
                 if venue == "hyperliquid":
                     bids, asks = hl.l2_book(symbol)
                     fee, maker_fee = HL_TAKER_FEE, HL_MAKER_FEE
+                    if ":" in symbol:
+                        fee, maker_fee = fee * HIP3_FEE_MULT, maker_fee * HIP3_FEE_MULT
+                        base_flags.append("HIP3_FEE_EST")
                 else:
                     if lt_fees is None:  # fees are quoted in percent
                         lt_fees = {str(d["market_id"]): (float(d.get("taker_fee") or 0) / 100,
@@ -137,7 +142,7 @@ def refresh_costs(conn, markets, now=None):
                     fee, maker_fee = lt_fees.get(str(market_id), (0.0, 0.0))
                 for size in COST_SIZES:
                     cost, mid = book_round_trip(bids, asks, size, fee)
-                    flags = "" if cost is not None else "NO_DEPTH"
+                    flags = ",".join(base_flags + ([] if cost is not None else ["NO_DEPTH"]))
                     stats["no_depth"] += cost is None
                     maker = 2 * maker_fee if cost is not None else None
                     rows.append((venue, symbol, size, cost, mid, 1, flags, now, maker))

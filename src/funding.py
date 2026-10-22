@@ -82,7 +82,7 @@ def ingest_hyperliquid(conn, now, backfill_s):
         except Exception as e:
             stats["errors"] += 1
             _mark(conn, "hyperliquid", sym, now, None, repr(e)[:300])
-        time.sleep(0.1)
+        time.sleep(0.25)  # pace Hyperliquid info requests (shared per-IP weight budget)
     return stats
 
 
