@@ -5,4 +5,4 @@ git archive --format=tar -o "$PSScriptRoot\release.tar" HEAD
 if ($LASTEXITCODE) { throw "git archive failed" }
 scp -i $key "$PSScriptRoot\release.tar" "$PSScriptRoot\setup.sh" "root@${ip}:/tmp/"
 if ($LASTEXITCODE) { throw "scp failed" }
-ssh -i $key "root@$ip" 'sed -i "s/\r$//" /tmp/setup.sh && bash /tmp/setup.sh'
+ssh -i $key "root@$ip" "tr -d '\r' < /tmp/setup.sh > /tmp/setup_lf.sh && bash /tmp/setup_lf.sh"

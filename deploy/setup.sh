@@ -15,6 +15,10 @@ if [ ! -f /etc/funding-scanner.provisioned ]; then
   touch /etc/funding-scanner.provisioned
 fi
 
+# clean up the mis-named account created by an earlier broken deploy
+if id scanne >/dev/null 2>&1; then userdel scanne; fi
+if getent group scanne >/dev/null; then groupdel scanne; fi
+
 getent group scanner >/dev/null || groupadd --system scanner
 id scanner >/dev/null 2>&1 || useradd --system --gid scanner --home "$DATA" --shell /usr/sbin/nologin scanner
 usermod -g scanner scanner
