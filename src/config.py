@@ -5,6 +5,14 @@ PRICE_TOL = float(os.environ.get("PRICE_TOL", "0.03"))
 BACKFILL_DAYS = float(os.environ.get("BACKFILL_DAYS", "7"))
 VAR_RATE_SOURCE = os.environ.get("VAR_RATE_SOURCE", "pre")  # 'pre' or 'post'; set from timing verdict
 VAR_WINDOW_S = int(os.environ.get("VAR_WINDOW_S", "900"))
+# Variational capture reliability: it has no funding history API, so every settlement must be captured live.
+VAR_PRE_CAPTURE_S = [int(x) for x in os.environ.get("VAR_PRE_CAPTURE_S", "180,90,30").split(",")]  # s before each
+VAR_LATE_WINDOW_S = int(os.environ.get("VAR_LATE_WINDOW_S", "3600"))  # fallback: newest snapshot within this window
+VAR_SNAPSHOT_KEEP_DAYS = float(os.environ.get("VAR_SNAPSHOT_KEEP_DAYS", "3"))
+RUNS_KEEP_DAYS = float(os.environ.get("RUNS_KEEP_DAYS", "30"))
+# Dashboard: served on localhost only, reached through an SSH tunnel (deploy/dashboard.ps1)
+DASHBOARD_HOST = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
+DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8765"))
 # Hyperliquid HIP-3 builder dexes to include (comma list). Each deployer runs its own oracle: allowlist only trusted ones.
 HIP3_DEXES = [d.strip() for d in os.environ.get("HIP3_DEXES", "xyz").split(",") if d.strip()]
 # Every tracked pair must have one leg on this venue (empty = all cross-venue pairs).

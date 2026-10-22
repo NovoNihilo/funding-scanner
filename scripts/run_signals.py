@@ -59,6 +59,8 @@ def main():
     print(f"as of {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(asof))}  basis={APY_BASIS}  "
           f"min APY 1x={MIN_APY_1X:.0%}  size=${PRIMARY_SIZE:,.0f}/leg  hold={HOLD_HORIZON_H:.0f}h  "
           f"required leg={REQUIRED_VENUE or 'any'}")
+    if REQUIRED_VENUE == "variational":
+        print("all pairs: TOS_RISK (Variational ToU 4.A.xv(6) prohibits cross-platform arbitrage); read-only scanner")
     if view:
         st = Counter(r[0] for r in conn.execute("SELECT status FROM signals"))
         print(f"view only (stored by the worker): pairs={sum(st.values())} status={dict(st)}")
@@ -86,13 +88,23 @@ def main():
             c = m["costs"].get(SZ, {})
             rng = f"{pct(r['apy_1x']).strip()}-{pct(r['apy_max']).strip()} {int(r['max_lev'])}x"
             basis = f"{c['basis_bps']:5.1f}bp" if c.get("status") == "OK" else "n/a"
-            flags = [f for f in (r["flags"] or "").split(",") if f and f not in ("ESTIMATED_DATA",)]
+            flags = [f for f in (r["flags"] or "").split(",") if f and f not in ("ESTIMATED_DATA", "TOS_RISK")]
             extra = flags + ([] if r["status"] == "QUALIFIED" else json.loads(r["reasons"])[:2])
             pair = vl(r["long_venue"], r["long_symbol"]) + ">" + vl(r["short_venue"], r["short_symbol"])
             print(f"{r['asset']:<9}{pair:<13}"
                   f"{r['status']:<11}{(r['cohort'] or '-'):<12}{r['age_h']:>4.0f}{pct(r['apy_1x']):>7}  {rng:<15}"
                   f"{money(c.get('cost_usd'))}{eta(c):>13}{money(c.get('net24_usd')):>8}"
                   f"{money(c.get('net_hold_usd')):>9}{basis:>8}  {'; '.join(extra)}")
+
+    warm = [json.loads(r["metrics"] or "{}").get("history_hours") for r in conn.execute(
+        "SELECT metrics FROM signals WHERE apy_1x IS NULL AND status != 'TERMINATED'")]
+    if warm:
+        b = Counter("not evaluated" if h is None else ("0h" if h <= 0 else ("1-7h" if h < 8 else
+                    ("8-15h" if h < 16 else "16-23h"))) for h in warm)
+        best = max((h for h in warm if h is not None), default=0)
+        print(f"\n=== WARMING UP: {len(warm)} pairs need 24h of comparable history before an APY ===")
+        print("  " + "  ".join(f"{k}: {b[k]}" for k in ("0h", "1-7h", "8-15h", "16-23h", "not evaluated") if b[k])
+              + f"   (most advanced: {best:.0f}h of 24h)")
 
     print("\n=== Why runs >=24h are not qualified (reason counts) ===")
     cnt = Counter()

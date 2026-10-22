@@ -3,7 +3,8 @@ positive = longs pay shorts. ts = UTC settlement time in seconds. Gaps are never
 import json
 import time
 
-from src.config import VAR_RATE_SOURCE, VAR_WINDOW_S
+from src.config import (RUNS_KEEP_DAYS, VAR_LATE_WINDOW_S, VAR_PRE_CAPTURE_S, VAR_RATE_SOURCE, VAR_SNAPSHOT_KEEP_DAYS,
+                        VAR_WINDOW_S)
 from src.venues import hyperliquid as hl, lighter as lt, variational as va
 
 HOUR = 3600
@@ -34,12 +35,23 @@ def matched_markets(conn, venue):
                         "ORDER BY symbol", (venue,)).fetchall()
 
 
+def first_gap(conn, venue, symbol, since, step=HOUR):
+    """Settlement time just before the earliest hole in a market's hourly series since `since`, or None."""
+    ts = [r[0] for r in conn.execute("SELECT ts FROM settlements WHERE venue=? AND symbol=? AND ts>=? ORDER BY ts",
+                                     (venue, symbol, since))]
+    return next((a for a, b in zip(ts, ts[1:]) if b - a > step), None)
+
+
 def _since(conn, venue, symbol, now, backfill_s):
+    """Fetch start: 3h before the last stored settlement (reconciles late/revised rows), or earlier when a hole
+    exists inside the backfill window (gap repair). Holes the venue genuinely lacks are simply re-requested."""
     row = conn.execute("SELECT last_ts FROM sync_state WHERE venue=? AND symbol=?",
                        (venue, symbol)).fetchone()
     if row and row["last_ts"]:
-        return row["last_ts"] - 3 * HOUR  # overlap to reconcile late/revised rows
-    return now - backfill_s
+        start = row["last_ts"] - 3 * HOUR
+        gap = first_gap(conn, venue, symbol, now - backfill_s)
+        return (gap, True) if gap is not None and gap < start else (start, False)
+    return now - backfill_s, False
 
 
 def _mark(conn, venue, symbol, now, last_ts=None, error=None):
@@ -60,12 +72,14 @@ def record_run(conn, job, started_at, ok, detail):
 # ---------------- Hyperliquid ----------------
 
 def ingest_hyperliquid(conn, now, backfill_s):
-    stats = {"markets": 0, "written": 0, "errors": 0}
+    stats = {"markets": 0, "written": 0, "errors": 0, "gap_repairs": 0}
     for m in matched_markets(conn, "hyperliquid"):
         sym = m["symbol"]
         stats["markets"] += 1
         try:
-            start_ms = _since(conn, "hyperliquid", sym, now, backfill_s) * 1000
+            start, repair = _since(conn, "hyperliquid", sym, now, backfill_s)
+            stats["gap_repairs"] += repair
+            start_ms = start * 1000
             last = None
             while True:
                 data = hl.funding_history(sym, start_ms, now * 1000)
@@ -110,13 +124,14 @@ def lighter_rate(row, price):
 
 
 def ingest_lighter(conn, now, backfill_s, progress=False):
-    stats = {"markets": 0, "written": 0, "errors": 0, "lt_value": 0, "lt_rate": 0}
+    stats = {"markets": 0, "written": 0, "errors": 0, "gap_repairs": 0, "lt_value": 0, "lt_rate": 0}
     markets = matched_markets(conn, "lighter")
     for i, m in enumerate(markets, 1):
         sym, mid = m["symbol"], int(m["market_id"])
         stats["markets"] += 1
         try:
-            start = _since(conn, "lighter", sym, now, backfill_s)
+            start, repair = _since(conn, "lighter", sym, now, backfill_s)
+            stats["gap_repairs"] += repair
             last = None
             while start < now:
                 end = min(now, start + 400 * HOUR)
@@ -145,6 +160,21 @@ def ingest_lighter(conn, now, backfill_s, progress=False):
 
 # ---------------- Variational (ESTIMATED) ----------------
 
+def upcoming_settlements(conn, now, recent_s=900):
+    """Settlement times announced by recent snapshots that are still in the future."""
+    return sorted(r[0] for r in conn.execute(
+        "SELECT DISTINCT next_ts FROM var_snapshots WHERE captured_at >= ? AND next_ts > ?", (now - recent_s, now)))
+
+
+def next_capture_time(now, upcoming, period=300, offset=30, pre_offsets=None):
+    """Next snapshot time: the regular grid (every `period` s at `offset`) or an extra capture `pre_offsets`
+    seconds before any upcoming settlement, whichever comes first."""
+    pre_offsets = VAR_PRE_CAPTURE_S if pre_offsets is None else pre_offsets
+    regular = (now - offset) // period * period + period + offset
+    extra = [t - o for t in upcoming for o in pre_offsets if t - o > now]
+    return min([regular] + extra)
+
+
 def capture_variational(conn, now=None):
     """Store one snapshot of funding + quotes for matched Variational perps."""
     now = int(now or time.time())
@@ -170,36 +200,52 @@ def capture_variational(conn, now=None):
     return len(rows)
 
 
-def derive_variational(conn, now=None, mode=None, window=None, lookback_s=3 * 86400):
+def derive_variational(conn, now=None, mode=None, window=None, lookback_s=3 * 86400, late_window=None):
     """Turn snapshots around each settlement time T into ESTIMATED settlements.
-    pre = last snapshot in [T-window, T) for that interval; post = first snapshot in [T, T+window].
-    Settlements without a usable snapshot are skipped, never zero-filled."""
+    pre  = last snapshot in [T-window, T) for that interval, recorded as soon as T has passed;
+           if none, the newest snapshot in [T-late_window, T-window) is used (source var_pre_late).
+    post = first snapshot in [T, T+window], recorded once that window has closed.
+    Settlements without a usable snapshot are skipped, never zero-filled. Re-deriving always keeps the best value."""
     now = int(now or time.time())
     mode = mode or VAR_RATE_SOURCE
     window = window or VAR_WINDOW_S
+    late_window = max(late_window or VAR_LATE_WINDOW_S, window)
+    ready = now if mode == "pre" else now - window
     written = 0
     syms = [r[0] for r in conn.execute("SELECT DISTINCT symbol FROM var_snapshots WHERE captured_at >= ?",
                                        (now - lookback_s,))]
     for sym in syms:
         snaps = conn.execute("""SELECT captured_at, next_ts, interval_s, interval_rate FROM var_snapshots
             WHERE symbol=? AND captured_at >= ? ORDER BY captured_at""",
-                             (sym, now - lookback_s - window)).fetchall()
+                             (sym, now - lookback_s - late_window)).fetchall()
         rows = []
-        for T in sorted({s["next_ts"] for s in snaps if s["next_ts"] and s["next_ts"] <= now - window}):
+        for T in sorted({s["next_ts"] for s in snaps if s["next_ts"] and s["next_ts"] <= ready}):
             pre = [s for s in snaps if T - window <= s["captured_at"] < T and s["next_ts"] == T]
+            late = [s for s in snaps if T - late_window <= s["captured_at"] < T - window and s["next_ts"] == T]
             post = [s for s in snaps if T <= s["captured_at"] <= T + window]
-            p = pre[-1] if pre else None
+            p = pre[-1] if pre else (late[-1] if late else None)
             q = post[0] if post else None
             chosen = p if mode == "pre" else q
             if chosen is None or chosen["interval_rate"] is None:
                 continue
+            source = f"var_{mode}" + ("_late" if mode == "pre" and not pre else "")
             raw = {"pre": p["interval_rate"] if p else None, "post": q["interval_rate"] if q else None,
                    "pre_age_s": T - p["captured_at"] if p else None,
                    "post_lag_s": q["captured_at"] - T if q else None}
             rows.append(("variational", sym, T, (p or q)["interval_s"], chosen["interval_rate"], None,
-                         "ESTIMATED", f"var_{mode}", json.dumps(raw)))
+                         "ESTIMATED", source, json.dumps(raw)))
         written += insert_settlements(conn, rows)
     return written
+
+
+def housekeeping(conn, now=None):
+    """Prune Variational snapshots and run logs beyond their retention (settlements are kept forever)."""
+    now = int(now or time.time())
+    with conn:
+        snaps = conn.execute("DELETE FROM var_snapshots WHERE captured_at < ?",
+                             (now - int(VAR_SNAPSHOT_KEEP_DAYS * 86400),)).rowcount
+        runs = conn.execute("DELETE FROM runs WHERE started_at < ?", (now - int(RUNS_KEEP_DAYS * 86400),)).rowcount
+    return {"snapshots_pruned": snaps, "runs_pruned": runs}
 
 
 # ---------------- Data quality ----------------

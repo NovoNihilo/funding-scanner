@@ -283,6 +283,7 @@ def evaluate_pair(lg, sh, long_r, short_r, now, lg_costs=None, sh_costs=None, p9
         "daily_net_per_1k": conservative * 24 * 1000 if conservative is not None else None,
         "pos_share_48h": w48["pos_share"], "pos_share_7d": w7["pos_share"],
         "coverage_24h": w24["coverage"], "coverage_7d": w7["coverage"],
+        "history_hours": w7["valid_hours"], "history_needed_hours": 24,
         "longest_neg_hours": longest_neg, "terminations": len(terms),
         "last_termination": terms[-1] if terms else None, "last_period_end": last_end, "grid_hours": grid_h,
         "stress_move": stress_move, "stress_lev": stress_lev,
