@@ -1,5 +1,5 @@
 """Always-on worker. Thread 'var': Variational snapshot every 5 min (:00:30, :05:30...).
-Thread 'sync': hourly at hh:04 -> refresh markets, HL + Lighter settled funding, timing verdict."""
+Thread 'sync': hourly at hh:04 -> refresh markets, HL + Lighter settled funding, signals, timing verdict."""
 import logging
 import os
 import signal
@@ -10,6 +10,7 @@ from src.config import BACKFILL_DAYS, DB_PATH, VAR_RATE_SOURCE
 from src.db import connect
 from src.funding import capture_variational, derive_variational, ingest_hyperliquid, ingest_lighter, record_run
 from src.matching import refresh_markets
+from src.signals import evaluate_all
 from src.var_timing import timing_report
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(threadName)s %(message)s")
@@ -58,6 +59,9 @@ def sync_loop():
             lts = ingest_lighter(conn, t0, backfill_s)
             log.info("sync hl=%s lt=%s took=%ds", hls, lts, int(time.time()) - t0)
             record_run(conn, "sync", t0, hls["errors"] + lts["errors"] == 0, {"hl": hls, "lt": lts})
+            sig = evaluate_all(conn)
+            log.info("signals %s", sig)
+            record_run(conn, "signals", t0, True, sig)
             log.info("var timing: %s", timing_report(conn))
         except Exception as e:
             log.exception("sync failed")
@@ -76,7 +80,7 @@ def main():
             STOP.wait(30)
             for t in threads:
                 if not t.is_alive() and not STOP.is_set():
-                    log.error("thread %s died; exiting so Railway restarts", t.name)
+                    log.error("thread %s died; exiting so systemd restarts it", t.name)
                     os._exit(1)
     except KeyboardInterrupt:
         STOP.set()

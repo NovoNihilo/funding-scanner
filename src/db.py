@@ -1,4 +1,4 @@
-"""SQLite access. DB_PATH env var points at the Railway volume in production."""
+"""SQLite access. DB_PATH env var points at the server data directory in production."""
 import sqlite3
 from pathlib import Path
 
@@ -72,6 +72,40 @@ CREATE TABLE IF NOT EXISTS runs (
     ok INTEGER,
     detail TEXT
 );
+
+CREATE TABLE IF NOT EXISTS signals (
+    pair_id TEXT PRIMARY KEY,
+    asset TEXT NOT NULL,
+    long_venue TEXT NOT NULL,
+    long_symbol TEXT NOT NULL,
+    short_venue TEXT NOT NULL,
+    short_symbol TEXT NOT NULL,
+    status TEXT NOT NULL,
+    cohort TEXT,
+    run_start INTEGER,
+    qualified_at INTEGER,
+    age_h REAL,
+    neg_streak INTEGER,
+    apy_1x REAL,
+    apy_max REAL,
+    max_lev REAL,
+    metrics TEXT,
+    flags TEXT,
+    reasons TEXT,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS signal_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair_id TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    event TEXT NOT NULL,
+    from_status TEXT,
+    to_status TEXT,
+    detail TEXT,
+    notified INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ix_events_pair ON signal_events(pair_id, ts);
 """
 
 MIGRATIONS = [("markets", "max_leverage", "REAL")]
