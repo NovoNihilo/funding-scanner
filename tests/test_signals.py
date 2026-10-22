@@ -1,4 +1,6 @@
 """Offline tests for the signal engine."""
+import json
+
 from src.db import connect
 from src.signals import (apy_numbers, build_periods, cohort_for, evaluate_all, leverage_limit, lifecycle,
                          mark_anomalies)
@@ -68,10 +70,14 @@ def test_cohorts():
     assert [cohort_for(h) for h in (5, 30, 100, 200)] == ["FRESH", "ACTIONABLE", "ESTABLISHED", "DURABLE"]
 
 
-def _seed(conn, now, short_rate, long_rate, hours=60):
+def _seed(conn, now, short_rate, long_rate, hours=60, rt_cost=0.0002, p99=0.04, rt_maker=0.0001):
     for v, s, lev in (("hyperliquid", "AAA", 20), ("lighter", "AAA", 20)):
         conn.execute("INSERT INTO markets (venue, symbol, asset, market_id, interval_s, asset_class, flags, matched,"
                      " active, updated_at, max_leverage) VALUES (?,?,?,?,3600,'crypto','',1,1,0,?)", (v, s, "AAA", s, lev))
+        for size in (1000.0, 5000.0):
+            conn.execute("INSERT INTO book_costs (venue, symbol, size_usd, rt_cost, mid, executable, flags, "
+                         "captured_at, rt_cost_maker) VALUES (?,?,?,?,100.0,1,'',?,?)", (v, s, size, rt_cost, now, rt_maker))
+    conn.execute("INSERT INTO price_stats VALUES ('AAA','hyperliquid',?,400,?)", (p99, now))
     for k in range(hours):
         t = now - k * H
         conn.execute("INSERT INTO settlements VALUES ('lighter','AAA',?,3600,?,0,'CONFIRMED','t',NULL,0)", (t, short_rate))
@@ -110,3 +116,41 @@ def test_qualified_then_failing_gate_is_suspended():
     evaluate_all(conn, now + 4 * H)
     row = conn.execute("SELECT status, reasons FROM signals WHERE pair_id='AAA|hyperliquid>lighter'").fetchone()
     assert row["status"] == "SUSPENDED" and "stale" in row["reasons"]
+
+
+def test_slow_payback_is_reported_not_blocking():
+    conn = connect(":memory:")
+    now = 1000 * H
+    # 3e-5/h net on $1k = $0.03/h; taker round trip 2 x 0.5% = $10 -> ~333h; maker 2 x 0.01% = $0.20 -> ~6.7h
+    _seed(conn, now, short_rate=3e-5, long_rate=0.0, rt_cost=0.005, rt_maker=0.0001)
+    evaluate_all(conn, now)
+    row = conn.execute("SELECT status, metrics FROM signals WHERE pair_id='AAA|hyperliquid>lighter'").fetchone()
+    c = json.loads(row["metrics"])["costs"]["1000"]
+    assert row["status"] == "QUALIFIED"
+    assert abs(c["payback_h"] - 0.01 / 3e-5) < 1e-6 and c["payback_tier"] == "SLOW"
+    assert abs(c["payback_h_maker"] - 0.0002 / 3e-5) < 1e-6
+    assert abs(c["net_hold_usd"] - (3e-5 * 168 - 0.01) * 1000) < 1e-9
+
+
+def test_missing_costs_do_not_block_and_candidates_returned():
+    conn = connect(":memory:")
+    now = 1000 * H
+    _seed(conn, now, short_rate=3e-5, long_rate=0.0)
+    conn.execute("DELETE FROM book_costs")
+    res = evaluate_all(conn, now, persist=False)
+    assert ("hyperliquid", "AAA", "AAA") in res["candidates"] and ("lighter", "AAA", "AAA") in res["candidates"]
+    assert conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 0  # persist=False writes nothing
+    evaluate_all(conn, now)  # costs are informational: the funding signal still qualifies
+    row = conn.execute("SELECT status, metrics FROM signals WHERE pair_id='AAA|hyperliquid>lighter'").fetchone()
+    assert row["status"] == "QUALIFIED" and json.loads(row["metrics"])["costs"]["1000"]["status"] == "MISSING"
+
+
+def test_stress_test_caps_leverage_range():
+    conn = connect(":memory:")
+    now = 1000 * H
+    _seed(conn, now, short_rate=3e-5, long_rate=0.0, p99=0.30)  # 37.5% buffered move, 20x venues -> 2x
+    evaluate_all(conn, now)
+    row = conn.execute("SELECT status, max_lev, apy_1x, apy_max FROM signals "
+                       "WHERE pair_id='AAA|hyperliquid>lighter'").fetchone()
+    assert row["status"] == "QUALIFIED" and row["max_lev"] == 2.0
+    assert abs(row["apy_max"] - 2 * row["apy_1x"]) < 1e-12

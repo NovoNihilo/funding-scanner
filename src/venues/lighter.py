@@ -39,6 +39,17 @@ def fundings(market_id, start_ts, end_ts, count_back=0, resolution="1h"):
     return _get("fundings", params).get("fundings", [])
 
 
+def order_book_orders(market_id, limit=250):
+    """Return (bids, asks) as [(price, base_size)], best first."""
+    data = _get("orderBookOrders", {"market_id": market_id, "limit": limit})
+
+    def side(rows, reverse):
+        lv = [(float(o["price"]), float(o["remaining_base_amount"])) for o in rows or []]
+        return sorted((x for x in lv if x[1] > 0), key=lambda x: x[0], reverse=reverse)
+
+    return side(data.get("bids"), True), side(data.get("asks"), False)
+
+
 def candles(market_id, start_ts, end_ts, resolution="1h"):
     count = min(500, int((end_ts - start_ts) / 3600) + 2)
 

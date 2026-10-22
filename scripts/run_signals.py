@@ -1,45 +1,80 @@
-"""Milestone 5: evaluate signals on the local DB and print a ranked review table.
-Uses the latest Hyperliquid settlement hour as 'now' so a local DB that isn't freshly synced still evaluates."""
+"""Evaluate signals on the local DB (with live execution costs) and print a ranked review table.
+Uses the latest Hyperliquid settlement hour as 'now' so a local DB that isn't freshly synced still evaluates.
+QUALIFIED pairs are ranked by expected net over HOLD_HORIZON_H at PRIMARY_SIZE (taker costs included).
+Usage: python -m scripts.run_signals [--offline]   (--offline skips fetching order books and price history)"""
 import json
+import sys
 import time
 from collections import Counter
 
-from src.config import APY_BASIS, MIN_APY_1X
+from src.config import APY_BASIS, HOLD_HORIZON_H, MIN_APY_1X, PRIMARY_SIZE
+from src.costs import refresh_costs, refresh_price_stats
 from src.db import connect
-from src.signals import evaluate_all
+from src.signals import evaluate_all, market_index, prioritized_assets
+
+SZ = str(int(PRIMARY_SIZE))
 
 
 def pct(x):
-    return f"{x * 100:6.1f}%" if x is not None else "    n/a"
+    return f"{x * 100:5.1f}%" if x is not None else "  n/a"
+
+
+def money(x):
+    return f"{x:7.2f}" if x is not None else "    n/a"
+
+
+def eta(c):
+    if c.get("status") != "OK":
+        return "n/a"
+    t, m = c.get("payback_h"), c.get("payback_h_maker")
+    f = (lambda h: "never" if h is None else (f"{h:.0f}h" if h < 1000 else ">999h"))
+    return f"{f(t)}/{f(m)}"
+
+
+def rank_key(r):
+    v = json.loads(r["metrics"]).get("rank_net_hold_usd")
+    return (v is None, -(v or 0))
 
 
 def main():
     conn = connect()
     asof = conn.execute("SELECT MAX(ts) FROM settlements WHERE venue='hyperliquid'").fetchone()[0] or int(time.time())
+    if "--offline" not in sys.argv:
+        pre = evaluate_all(conn, asof, persist=False)
+        t0 = time.time()
+        cst = refresh_costs(conn, pre["candidates"])
+        pst = refresh_price_stats(conn, prioritized_assets(market_index(conn), pre["candidates"]), max_n=80)
+        print(f"costs {cst}  price_stats {pst}  ({time.time() - t0:.0f}s)")
     res = evaluate_all(conn, asof)
-    print(f"as of {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(asof))}  basis={APY_BASIS}  min APY 1x={MIN_APY_1X:.0%}")
+    print(f"as of {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(asof))}  basis={APY_BASIS}  "
+          f"min APY 1x={MIN_APY_1X:.0%}  size=${PRIMARY_SIZE:,.0f}/leg  hold={HOLD_HORIZON_H:.0f}h")
     print(f"pairs={res['pairs']} events={res['events']} status={res['status']}")
 
-    rows = conn.execute("SELECT * FROM signals WHERE apy_1x IS NOT NULL ORDER BY apy_1x DESC").fetchall()
-    head = (f"{'asset':<10}{'long>short':<11}{'status':<11}{'cohort':<12}{'age_h':>6}{'APY1x':>8}"
-            f"  {'APY range':<17}{'$/day/1k':>9}{'pos48':>7}{'cov24':>7}  flags")
-    for title, keep in (("QUALIFIED", lambda r: r["status"] == "QUALIFIED"),
-                        ("TOP NON-QUALIFIED (by APY)", lambda r: r["status"] != "QUALIFIED")):
-        sel = [r for r in rows if keep(r)][:20]
-        print(f"\n=== {title} ({sum(1 for r in rows if keep(r))} total, showing {len(sel)}) ===")
+    rows = conn.execute("SELECT * FROM signals WHERE apy_1x IS NOT NULL").fetchall()
+    head = (f"{'asset':<9}{'pair':<6}{'status':<11}{'cohort':<12}{'age':>4}{'APY1x':>7}  {'range':<15}"
+            f"{'cost':>7}{'payback t/m':>13}{'net24':>8}{'net hold':>9}{'basis':>8}  flags / reasons")
+    sections = (("QUALIFIED (ranked by expected net over hold)", [r for r in rows if r["status"] == "QUALIFIED"],
+                 rank_key),
+                ("TOP NON-QUALIFIED (by APY)", [r for r in rows if r["status"] != "QUALIFIED"],
+                 lambda r: -r["apy_1x"]))
+    for title, sel_all, key in sections:
+        sel = sorted(sel_all, key=key)[:15]
+        print(f"\n=== {title}: {len(sel_all)} total, showing {len(sel)} ===")
         print(head)
         for r in sel:
             m = json.loads(r["metrics"])
-            rng = f"{pct(r['apy_1x']).strip()}-{pct(r['apy_max']).strip()} ({int(r['max_lev'])}x)"
-            daily = m["daily_net_per_1k"]
-            flags = ",".join(f for f in (r["flags"] or "").split(",") if f and f != "ESTIMATED_DATA")
-            print(f"{r['asset']:<10}{r['long_venue'][:3] + '>' + r['short_venue'][:3]:<11}{r['status']:<11}"
-                  f"{(r['cohort'] or '-'):<12}{r['age_h']:>6.0f}{pct(r['apy_1x']):>8}  {rng:<17}"
-                  f"{(f'{daily:.2f}' if daily is not None else 'n/a'):>9}{pct(m['pos_share_48h']):>7}"
-                  f"{pct(m['coverage_24h']):>7}  {flags}")
+            c = m["costs"].get(SZ, {})
+            rng = f"{pct(r['apy_1x']).strip()}-{pct(r['apy_max']).strip()} {int(r['max_lev'])}x"
+            basis = f"{c['basis_bps']:5.1f}bp" if c.get("status") == "OK" else "n/a"
+            flags = [f for f in (r["flags"] or "").split(",") if f and f not in ("ESTIMATED_DATA",)]
+            extra = flags + ([] if r["status"] == "QUALIFIED" else json.loads(r["reasons"])[:2])
+            print(f"{r['asset']:<9}{r['long_venue'][:1].upper() + '>' + r['short_venue'][:1].upper():<6}"
+                  f"{r['status']:<11}{(r['cohort'] or '-'):<12}{r['age_h']:>4.0f}{pct(r['apy_1x']):>7}  {rng:<15}"
+                  f"{money(c.get('cost_usd'))}{eta(c):>13}{money(c.get('net24_usd')):>8}"
+                  f"{money(c.get('net_hold_usd')):>9}{basis:>8}  {'; '.join(extra)}")
 
     print("\n=== Why runs >=24h are not qualified (reason counts) ===")
-    c = Counter()
+    cnt = Counter()
     for r in conn.execute("SELECT reasons FROM signals WHERE status IN ('MONITORING','SUSPENDED') AND age_h >= 24"):
         for reason in json.loads(r["reasons"]):
             key = reason
@@ -47,8 +82,8 @@ def main():
                                   ("consistency", "consistency below minimum")):
                 if reason.startswith(prefix):
                     key = label
-            c[key] += 1
-    for k, n in c.most_common(10):
+            cnt[key] += 1
+    for k, n in cnt.most_common(10):
         print(f"  {n:>4}  {k}")
     print("\nSIGNALS OK")
 

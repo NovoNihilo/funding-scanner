@@ -106,9 +106,33 @@ CREATE TABLE IF NOT EXISTS signal_events (
     notified INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_events_pair ON signal_events(pair_id, ts);
+
+-- round-trip execution cost per market and size (fraction of notional; NULL = not enough depth)
+-- rt_cost: taker in and out (spread + slippage + fees); rt_cost_maker: resting orders filled at the touch (fees only)
+CREATE TABLE IF NOT EXISTS book_costs (
+    venue TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    size_usd REAL NOT NULL,
+    rt_cost REAL,
+    mid REAL,
+    executable INTEGER NOT NULL,
+    flags TEXT NOT NULL DEFAULT '',
+    captured_at INTEGER NOT NULL,
+    rt_cost_maker REAL,
+    PRIMARY KEY (venue, symbol, size_usd)
+);
+
+-- 99th percentile absolute 24h price move, for the leverage stress test
+CREATE TABLE IF NOT EXISTS price_stats (
+    asset TEXT PRIMARY KEY,
+    source TEXT,
+    p99_24h REAL,
+    n INTEGER,
+    updated_at INTEGER NOT NULL
+);
 """
 
-MIGRATIONS = [("markets", "max_leverage", "REAL")]
+MIGRATIONS = [("markets", "max_leverage", "REAL"), ("book_costs", "rt_cost_maker", "REAL")]
 
 
 def connect(path=None):

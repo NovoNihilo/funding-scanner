@@ -1,5 +1,6 @@
 """Always-on worker. Thread 'var': Variational snapshot every 5 min (:00:30, :05:30...).
-Thread 'sync': hourly at hh:04 -> refresh markets, HL + Lighter settled funding, signals, timing verdict."""
+Thread 'sync': hourly at hh:04 -> refresh markets, HL + Lighter settled funding,
+costs for candidate pairs, 24h-move stats, signals, timing verdict."""
 import logging
 import os
 import signal
@@ -7,10 +8,11 @@ import threading
 import time
 
 from src.config import BACKFILL_DAYS, DB_PATH, VAR_RATE_SOURCE
+from src.costs import refresh_costs, refresh_price_stats
 from src.db import connect
 from src.funding import capture_variational, derive_variational, ingest_hyperliquid, ingest_lighter, record_run
 from src.matching import refresh_markets
-from src.signals import evaluate_all
+from src.signals import evaluate_all, market_index, prioritized_assets
 from src.var_timing import timing_report
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(threadName)s %(message)s")
@@ -59,9 +61,13 @@ def sync_loop():
             lts = ingest_lighter(conn, t0, backfill_s)
             log.info("sync hl=%s lt=%s took=%ds", hls, lts, int(time.time()) - t0)
             record_run(conn, "sync", t0, hls["errors"] + lts["errors"] == 0, {"hl": hls, "lt": lts})
+            pre = evaluate_all(conn, persist=False)
+            cst = refresh_costs(conn, pre["candidates"])
+            pst = refresh_price_stats(conn, prioritized_assets(market_index(conn), pre["candidates"]), max_n=40)
             sig = evaluate_all(conn)
-            log.info("signals %s", sig)
-            record_run(conn, "signals", t0, True, sig)
+            sig.pop("candidates")
+            log.info("costs %s price_stats %s signals %s", cst, pst, sig)
+            record_run(conn, "signals", t0, True, {"costs": cst, "price_stats": pst, "signals": sig})
             log.info("var timing: %s", timing_report(conn))
         except Exception as e:
             log.exception("sync failed")

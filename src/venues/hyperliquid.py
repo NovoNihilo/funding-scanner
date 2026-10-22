@@ -25,3 +25,17 @@ def funding_history(coin, start_ms, end_ms=None):
     if end_ms is not None:
         body["endTime"] = int(end_ms)
     return _post(body)
+
+
+def l2_book(coin):
+    """Return (bids, asks) as [(price, size_in_contract_units)], best first."""
+    data = _post({"type": "l2Book", "coin": coin})
+    bids, asks = data["levels"]
+    return ([(float(x["px"]), float(x["sz"])) for x in bids], [(float(x["px"]), float(x["sz"])) for x in asks])
+
+
+def hourly_closes(coin, start_s, end_s):
+    """Map hour-end timestamp (s) -> close of the 1h candle ending then."""
+    rows = _post({"type": "candleSnapshot", "req": {"coin": coin, "interval": "1h",
+                                                     "startTime": int(start_s * 1000), "endTime": int(end_s * 1000)}})
+    return {int(r["t"]) // 1000 + 3600: float(r["c"]) for r in rows}

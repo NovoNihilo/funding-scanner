@@ -9,7 +9,10 @@ For each matched asset and each (long venue, short venue) orientation:
 3. Lifecycle: a run starts at the first positive period and ends after TERMINATE_AFTER consecutive
    non-positive periods. Missing and excluded periods neither count nor reset.
 4. Gates (after 24h of run age): conservative funding > 0, capital APY at 1x >= MIN_APY_1X,
-   consistency, data coverage, tradable markets. Execution-cost gate is added in M6.
+   consistency, data coverage, tradable markets. Gates judge the FUNDING signal only.
+5. Execution economics are informational and never block a signal: round-trip cost (taker worst case and
+   maker best case), payback ETA, expected 24h net and expected net over HOLD_HORIZON_H (used for ranking).
+6. Leverage range: 1x up to min(venue limits, MAX_LEVERAGE_CAP, 24h-stress-safe leverage).
 """
 import json
 import time
@@ -17,12 +20,15 @@ from collections import Counter
 from itertools import permutations
 from statistics import median
 
-from src.config import (ANOMALY_MAD_K, ANOMALY_MIN_HOURLY, APY_BASIS, MAX_LEVERAGE_CAP, MIN_APY_1X,
-                        MIN_COVERAGE, MIN_POSITIVE_SHARE, SIGNAL_LOOKBACK_DAYS, TERMINATE_AFTER)
+from src.config import (ANOMALY_MAD_K, ANOMALY_MIN_HOURLY, APY_BASIS, COST_MAX_AGE_S, COST_SIZES, HOLD_HORIZON_H,
+                        MAX_LEVERAGE_CAP, MIN_APY_1X, MIN_COVERAGE, MIN_POSITIVE_SHARE, PAYBACK_FAST_H,
+                        PAYBACK_OK_H, PRIMARY_SIZE, SIGNAL_LOOKBACK_DAYS, TERMINATE_AFTER)
+from src.costs import stress_leverage
 
 HOUR = 3600
 BLOCKING_FLAGS = {"REDUCE_ONLY", "HIDDEN", "PREIPO", "NO_FUNDING"}
 COHORTS = ((24, "FRESH"), (48, "ACTIONABLE"), (168, "ESTABLISHED"))
+COST_CANDIDATE_FRACTION = 0.8  # fetch execution costs for pairs within 80% of the APY minimum
 
 
 # ---------------- periods ----------------
@@ -159,12 +165,57 @@ def _load(conn, venue, symbol, since):
         (venue, symbol, since))}
 
 
+def payback_tier(hours):
+    if hours is None:
+        return "NEVER"
+    return "FAST" if hours <= PAYBACK_FAST_H else ("OK" if hours <= PAYBACK_OK_H else "SLOW")
+
+
+def pair_costs(lg, sh, lg_costs, sh_costs, conservative):
+    """Per size: round-trip cost (USD) taker/maker, payback ETA (hours) taker/maker, expected 24h net and
+    expected net over HOLD_HORIZON_H (taker, USD), adverse basis (bps). lg_costs/sh_costs: {size: book_costs row}.
+    Adverse basis = long venue priced above short venue at entry (assumed to converge by exit);
+    a favourable basis is not counted as profit."""
+    out, flags = {}, set()
+
+    def payback(frac):
+        return frac / conservative if conservative and conservative > 0 else None
+
+    for size in COST_SIZES:
+        cl, cs = lg_costs.get(size), sh_costs.get(size)
+        if cl is None or cs is None:
+            out[size] = {"status": "MISSING"}
+            continue
+        if cl["rt_cost"] is None or cs["rt_cost"] is None:
+            out[size] = {"status": "NO_DEPTH"}
+            continue
+        for row in (cl, cs):
+            flags.update(f for f in (row["flags"] or "").split(",") if f)
+        basis = 0.0
+        if cl["mid"] and cs["mid"]:
+            ul, us = cl["mid"] / lg["multiplier"], cs["mid"] / sh["multiplier"]
+            basis = (ul - us) / ((ul + us) / 2)
+        adverse = max(0.0, basis)
+        frac = cl["rt_cost"] + cs["rt_cost"] + adverse
+        mk_l = cl["rt_cost_maker"] if cl["rt_cost_maker"] is not None else cl["rt_cost"]
+        mk_s = cs["rt_cost_maker"] if cs["rt_cost_maker"] is not None else cs["rt_cost"]
+        frac_mk = mk_l + mk_s + adverse
+        ok = conservative is not None
+        out[size] = {"status": "OK", "cost_usd": frac * size, "cost_usd_maker": frac_mk * size,
+                     "cost_bps": frac * 1e4, "basis_bps": basis * 1e4,
+                     "payback_h": payback(frac), "payback_h_maker": payback(frac_mk),
+                     "payback_tier": payback_tier(payback(frac)),
+                     "net24_usd": (conservative * 24 - frac) * size if ok else None,
+                     "net_hold_usd": (conservative * HOLD_HORIZON_H - frac) * size if ok else None}
+    return out, sorted(flags)
+
+
 def _normal_interval(rates):
     c = Counter(v[1] for v in rates.values())
     return c.most_common(1)[0][0] if c else None
 
 
-def evaluate_pair(lg, sh, long_r, short_r, now):
+def evaluate_pair(lg, sh, long_r, short_r, now, lg_costs=None, sh_costs=None, p99=None):
     """lg/sh: market rows (dict-like) for long and short legs. Returns signal dict (without stored state)."""
     grid = "long" if lg["venue"] == "variational" else ("short" if sh["venue"] == "variational" else None)
     periods = build_periods(long_r, short_r, grid)
@@ -194,7 +245,11 @@ def evaluate_pair(lg, sh, long_r, short_r, now):
     w24, w48, w7 = (window_stats(periods, now, h) for h in (24, 48, 168))
     candidates = [w["avg_hourly"] for w in (w48, w7) if w["avg_hourly"] is not None and w["valid_hours"] >= 24]
     conservative = min(candidates) if candidates else None
-    max_lev = leverage_limit(lg["max_leverage"], sh["max_leverage"])
+    stress_lev, stress_move = stress_leverage(p99, [(lg["venue"], lg["max_leverage"]),
+                                                    (sh["venue"], sh["max_leverage"])])
+    max_lev = min(leverage_limit(lg["max_leverage"], sh["max_leverage"]), stress_lev)
+    if p99 is None:
+        flags.add("STRESS_DEFAULT")
     spread_apr, apy_1x, apy_max = apy_numbers(conservative, max_lev) if conservative is not None else (None,) * 3
 
     run_start, neg, terms, longest_neg = lifecycle(periods)
@@ -215,6 +270,11 @@ def evaluate_pair(lg, sh, long_r, short_r, now):
         reasons.append(f"coverage {w24['coverage']:.0%} < {MIN_COVERAGE:.0%} (24h)")
     if last_end is None or now - last_end > max(2 * grid_h, 3) * HOUR:
         reasons.append("stale data")
+    costs, cost_flags = pair_costs(lg, sh, lg_costs or {}, sh_costs or {}, conservative)
+    flags.update(f"Q_{f}" for f in cost_flags if f != "INDICATIVE")
+    primary = costs.get(PRIMARY_SIZE, {"status": "MISSING"})
+    if primary["status"] == "NO_DEPTH":
+        flags.add("NO_DEPTH")
 
     metrics = {
         "avg_hourly_24h": w24["avg_hourly"], "avg_hourly_48h": w48["avg_hourly"], "avg_hourly_7d": w7["avg_hourly"],
@@ -224,6 +284,9 @@ def evaluate_pair(lg, sh, long_r, short_r, now):
         "coverage_24h": w24["coverage"], "coverage_7d": w7["coverage"],
         "longest_neg_hours": longest_neg, "terminations": len(terms),
         "last_termination": terms[-1] if terms else None, "last_period_end": last_end, "grid_hours": grid_h,
+        "stress_move": stress_move, "stress_lev": stress_lev,
+        "costs": {str(int(k)): v for k, v in costs.items()},
+        "rank_net_hold_usd": primary.get("net_hold_usd"),
     }
     return {"run_start": run_start, "neg_streak": neg, "age_h": age_h, "terminated_recently": bool(terms) and
             run_start is None, "apy_1x": apy_1x, "apy_max": apy_max, "max_lev": max_lev,
@@ -245,18 +308,44 @@ def decide_status(sig, prev):
 
 
 def _markets(conn):
-    return conn.execute("SELECT venue, symbol, asset, asset_class, flags, max_leverage, interval_s FROM markets "
-                        "WHERE matched=1 AND active=1").fetchall()
+    return conn.execute("SELECT venue, symbol, asset, asset_class, flags, max_leverage, interval_s, multiplier, "
+                        "market_id FROM markets WHERE matched=1 AND active=1").fetchall()
 
 
-def evaluate_all(conn, now=None):
-    """Recompute every orientation, persist signals, record status/cohort transitions as events."""
+def _cost_rows(conn, now):
+    out = {}
+    for r in conn.execute("SELECT * FROM book_costs WHERE captured_at >= ?", (now - COST_MAX_AGE_S,)):
+        out.setdefault((r["venue"], r["symbol"]), {})[r["size_usd"]] = r
+    return out
+
+
+def market_index(conn):
+    """{asset: [(venue, symbol, market_id)]} for matched, active markets."""
+    out = {}
+    for m in _markets(conn):
+        out.setdefault(m["asset"], []).append((m["venue"], m["symbol"], m["market_id"]))
+    return out
+
+
+def prioritized_assets(index, candidates):
+    """Reorder {asset: legs} so assets of cost candidates come first (for the stress-stats refresh)."""
+    owner = {(v, s): a for a, legs in index.items() for v, s, _ in legs}
+    first = {owner[(v, s)] for v, s, _ in candidates if (v, s) in owner}
+    return {a: index[a] for a in sorted(index, key=lambda a: (a not in first, a))}
+
+
+def evaluate_all(conn, now=None, persist=True):
+    """Recompute every orientation. persist=True stores signals and status/cohort transition events.
+    Always returns a summary including 'candidates': markets whose execution costs should be refreshed."""
     now = int((now or time.time()) // HOUR * HOUR)
     since = int(now - SIGNAL_LOOKBACK_DAYS * 86400 - 8 * HOUR)
     by_asset = {}
     for m in _markets(conn):
         by_asset.setdefault(m["asset"], []).append(m)
     cache = {}
+    costs = _cost_rows(conn, now)
+    p99s = {r["asset"]: r["p99_24h"] for r in conn.execute("SELECT asset, p99_24h FROM price_stats")}
+    candidates = set()
 
     def rates(m):
         key = (m["venue"], m["symbol"])
@@ -271,8 +360,13 @@ def evaluate_all(conn, now=None):
             if lg["venue"] == sh["venue"]:
                 continue
             pair_id = f"{asset}|{lg['venue']}>{sh['venue']}"
-            sig = evaluate_pair(lg, sh, rates(lg), rates(sh), now)
+            sig = evaluate_pair(lg, sh, rates(lg), rates(sh), now, costs.get((lg["venue"], lg["symbol"])),
+                                costs.get((sh["venue"], sh["symbol"])), p99s.get(asset))
             prev = prev_rows.get(pair_id)
+            if (sig["apy_1x"] is not None and sig["apy_1x"] >= COST_CANDIDATE_FRACTION * MIN_APY_1X) or \
+                    (prev is not None and prev["status"] == "QUALIFIED"):
+                candidates.update({(lg["venue"], lg["symbol"], lg["market_id"]),
+                                   (sh["venue"], sh["symbol"], sh["market_id"])})
             status, cohort, qualified_at = decide_status(sig, prev)
             if status == "QUALIFIED" and not qualified_at:
                 qualified_at = now
@@ -288,9 +382,12 @@ def evaluate_all(conn, now=None):
                          sig["run_start"], qualified_at, round(sig["age_h"], 2), sig["neg_streak"], sig["apy_1x"],
                          sig["apy_max"], sig["max_lev"], json.dumps(sig["metrics"]), ",".join(sig["flags"]),
                          json.dumps(sig["reasons"]), now))
+    summary = {"pairs": len(rows), "events": len(events), "status": dict(Counter(r[6] for r in rows)),
+               "candidates": sorted(candidates)}
+    if not persist:
+        return summary
     with conn:
         conn.executemany("INSERT OR REPLACE INTO signals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         conn.executemany("INSERT INTO signal_events (pair_id, ts, event, from_status, to_status, detail) "
                          "VALUES (?,?,?,?,?,?)", events)
-    return {"pairs": len(rows), "events": len(events),
-            "status": dict(Counter(r[6] for r in rows))}
+    return summary
