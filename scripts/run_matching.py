@@ -2,6 +2,7 @@
 from collections import Counter, defaultdict
 from itertools import combinations
 
+from src.config import REQUIRED_VENUE
 from src.db import connect
 from src.matching import refresh_markets
 
@@ -24,8 +25,9 @@ def main():
     print(f"\nmatched assets={len(matched)}")
     for k, n in combos.most_common():
         print(f"  {k}: {n}")
-    pairs = sum(len(list(combinations(sorted({r['venue'] for r in g}), 2))) for g in matched.values())
-    print(f"cross-venue pairs (unordered)={pairs}")
+    pairs = sum(len([c for c in combinations(sorted({r['venue'] for r in g}), 2)
+                     if not REQUIRED_VENUE or REQUIRED_VENUE in c]) for g in matched.values())
+    print(f"cross-venue pairs (unordered)={pairs}  required venue={REQUIRED_VENUE or 'any'}")
     print(f"matched by asset class: {dict(Counter(g[0]['asset_class'] for g in matched.values()))}")
     print("\nmultiplier-normalized matches:")
     for a, g in sorted(matched.items()):

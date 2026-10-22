@@ -2,13 +2,14 @@
 Hyperliquid = main dex (crypto) + allowlisted HIP-3 builder dexes (HIP3_DEXES, default 'xyz': stocks, indices,
 commodities, FX). Each HIP-3 deployer runs its own oracle, so untrusted deployers are never fetched.
 HIP-3 markets whose asset is already listed on the main dex are skipped (duplicate crypto listings).
-Only assets that agree on price across >= 2 venues are matched; everything else is stored but never evaluated."""
+Only assets that agree on price across >= 2 venues, one of them REQUIRED_VENUE (default Variational), are matched;
+everything else is stored but never synced or evaluated."""
 import re
 import time
 from math import log10
 from statistics import median
 
-from src.config import HIP3_DEXES, PRICE_TOL
+from src.config import HIP3_DEXES, PRICE_TOL, REQUIRED_VENUE
 from src.venues import hyperliquid as hl, lighter as lt, variational as va
 
 VENUES = ("variational", "hyperliquid", "lighter")
@@ -112,7 +113,7 @@ def fetch_variational():
 
 
 def validate(rows, tol=PRICE_TOL):
-    """matched=1 when >=2 venues agree on per-unit price within tol.
+    """matched=1 when >=2 venues agree on per-unit price within tol and one of them is REQUIRED_VENUE.
     A market quoted at a power-of-ten scale of an agreed price (e.g. a full index vs a 1/10 index) is rescued
     by adjusting its multiplier (flag SCALE=x), within SCALE_TOL. The asset class comes from the matched markets,
     so an unrelated same-ticker market (e.g. a stock sharing a coin's ticker) cannot relabel the group."""
@@ -149,10 +150,12 @@ def validate(rows, tol=PRICE_TOL):
             if len({r["venue"] for r in good}) < 2:
                 good = []
             for r in priced:
-                if any(r is g for g in good):
-                    r["matched"] = 1
-                else:
+                if not any(r is g for g in good):
                     r["flags"].append("PRICE_MISMATCH")
+            if REQUIRED_VENUE and REQUIRED_VENUE not in {r["venue"] for r in good}:
+                good = []  # no leg on the required venue: nothing to trade
+            for r in good:
+                r["matched"] = 1
         known = {r["asset_class"] for r in (good or grp) if r["asset_class"]}
         cls = "tradfi" if "tradfi" in known else ("crypto" if known else "unknown")
         for r in grp:

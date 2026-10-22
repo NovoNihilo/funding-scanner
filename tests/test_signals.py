@@ -1,12 +1,20 @@
 """Offline tests for the signal engine."""
 import json
 
+import pytest
+
+import src.signals as signals
 from src.db import connect
 from src.signals import (apy_numbers, build_periods, cohort_for, evaluate_all, leverage_limit, lifecycle,
                          mark_anomalies)
 
 H = 3600
 PAIR = "AAA|hyperliquid:AAA>lighter:AAA"
+
+
+@pytest.fixture(autouse=True)
+def _any_venue(monkeypatch):
+    monkeypatch.setattr(signals, "REQUIRED_VENUE", "")  # fixtures below use Hyperliquid/Lighter pairs
 
 
 def _hourly(start, n, rate, quality="CONFIRMED"):
@@ -175,3 +183,17 @@ def test_multiple_markets_per_venue_get_distinct_pairs_and_stale_pairs_are_remov
     conn.execute("UPDATE markets SET active=0 WHERE symbol='xyz:AAA'")
     res = evaluate_all(conn, now + H)
     assert res["removed"] == 2 and conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 2
+
+
+def test_required_venue_drops_pairs_without_it(monkeypatch):
+    conn = connect(":memory:")
+    now = 1000 * H
+    _seed(conn, now, short_rate=3e-5, long_rate=0.0)
+    assert evaluate_all(conn, now)["pairs"] == 2
+    monkeypatch.setattr(signals, "REQUIRED_VENUE", "variational")
+    conn.execute("INSERT INTO markets (venue, symbol, asset, market_id, interval_s, asset_class, flags, matched,"
+                 " active, updated_at) VALUES ('variational','AAA-PERP','AAA','AAA-PERP',3600,'crypto','',1,1,0)")
+    res = evaluate_all(conn, now)
+    ids = {r[0] for r in conn.execute("SELECT pair_id FROM signals")}
+    assert res["removed"] == 2 and res["pairs"] == 4  # hyperliquid<>lighter gone, both legs vs variational kept
+    assert all("variational:" in pid for pid in ids)

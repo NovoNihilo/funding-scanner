@@ -1,6 +1,6 @@
 """Signal engine.
 
-For each matched asset and each (long venue, short venue) orientation:
+For each matched asset and each (long venue, short venue) orientation with a leg on REQUIRED_VENUE (if set):
 1. Build comparable funding periods. The grid is the coarser leg's settlement schedule:
    hourly for Hyperliquid/Lighter pairs, Variational's own settlement times (1h/4h/8h) otherwise.
    A period is complete only when every settlement both legs owe in it exists; nothing is zero-filled.
@@ -22,7 +22,7 @@ from statistics import median
 
 from src.config import (ANOMALY_MAD_K, ANOMALY_MIN_HOURLY, APY_BASIS, COST_MAX_AGE_S, COST_SIZES, HOLD_HORIZON_H,
                         MAX_LEVERAGE_CAP, MIN_APY_1X, MIN_COVERAGE, MIN_POSITIVE_SHARE, PAYBACK_FAST_H,
-                        PAYBACK_OK_H, PRIMARY_SIZE, SIGNAL_LOOKBACK_DAYS, TERMINATE_AFTER)
+                        PAYBACK_OK_H, PRIMARY_SIZE, REQUIRED_VENUE, SIGNAL_LOOKBACK_DAYS, TERMINATE_AFTER)
 from src.costs import stress_leverage
 
 HOUR = 3600
@@ -358,7 +358,7 @@ def evaluate_all(conn, now=None, persist=True):
     rows, events = [], []
     for asset, ms in by_asset.items():
         for lg, sh in permutations(ms, 2):
-            if lg["venue"] == sh["venue"]:
+            if lg["venue"] == sh["venue"] or (REQUIRED_VENUE and REQUIRED_VENUE not in (lg["venue"], sh["venue"])):
                 continue
             pair_id = f"{asset}|{lg['venue']}:{lg['symbol']}>{sh['venue']}:{sh['symbol']}"
             sig = evaluate_pair(lg, sh, rates(lg), rates(sh), now, costs.get((lg["venue"], lg["symbol"])),

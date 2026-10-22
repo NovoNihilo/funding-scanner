@@ -1,13 +1,15 @@
 """Evaluate signals on the local DB (with live execution costs) and print a ranked review table.
 Uses the latest Hyperliquid settlement hour as 'now' so a local DB that isn't freshly synced still evaluates.
 QUALIFIED pairs are ranked by expected net over HOLD_HORIZON_H at PRIMARY_SIZE (taker costs included).
-Usage: python -m scripts.run_signals [--offline]   (--offline skips fetching order books and price history)"""
+Usage: python -m scripts.run_signals [--offline | --view]
+  --offline  skip fetching order books and price history
+  --view     read-only: print the signals the worker last stored (use on the server; writes nothing)"""
 import json
 import sys
 import time
 from collections import Counter
 
-from src.config import APY_BASIS, HOLD_HORIZON_H, MIN_APY_1X, PRIMARY_SIZE
+from src.config import APY_BASIS, HOLD_HORIZON_H, MIN_APY_1X, PRIMARY_SIZE, REQUIRED_VENUE
 from src.costs import refresh_costs, refresh_price_stats
 from src.db import connect
 from src.signals import evaluate_all, market_index, prioritized_assets
@@ -43,17 +45,26 @@ def rank_key(r):
 
 def main():
     conn = connect()
-    asof = conn.execute("SELECT MAX(ts) FROM settlements WHERE venue='hyperliquid'").fetchone()[0] or int(time.time())
-    if "--offline" not in sys.argv:
+    view = "--view" in sys.argv
+    if view:
+        asof = conn.execute("SELECT MAX(updated_at) FROM signals").fetchone()[0] or int(time.time())
+    else:
+        asof = conn.execute("SELECT MAX(ts) FROM settlements WHERE venue='hyperliquid'").fetchone()[0] or int(time.time())
+    if not view and "--offline" not in sys.argv:
         pre = evaluate_all(conn, asof, persist=False)
         t0 = time.time()
         cst = refresh_costs(conn, pre["candidates"])
         pst = refresh_price_stats(conn, prioritized_assets(market_index(conn), pre["candidates"]), max_n=80)
         print(f"costs {cst}  price_stats {pst}  ({time.time() - t0:.0f}s)")
-    res = evaluate_all(conn, asof)
     print(f"as of {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(asof))}  basis={APY_BASIS}  "
-          f"min APY 1x={MIN_APY_1X:.0%}  size=${PRIMARY_SIZE:,.0f}/leg  hold={HOLD_HORIZON_H:.0f}h")
-    print(f"pairs={res['pairs']} events={res['events']} removed={res['removed']} status={res['status']}")
+          f"min APY 1x={MIN_APY_1X:.0%}  size=${PRIMARY_SIZE:,.0f}/leg  hold={HOLD_HORIZON_H:.0f}h  "
+          f"required leg={REQUIRED_VENUE or 'any'}")
+    if view:
+        st = Counter(r[0] for r in conn.execute("SELECT status FROM signals"))
+        print(f"view only (stored by the worker): pairs={sum(st.values())} status={dict(st)}")
+    else:
+        res = evaluate_all(conn, asof)
+        print(f"pairs={res['pairs']} events={res['events']} removed={res['removed']} status={res['status']}")
     cls = Counter(r["asset_class"] for r in conn.execute(
         "SELECT DISTINCT asset, asset_class FROM markets WHERE matched=1 AND active=1"))
     hip3 = conn.execute("SELECT COUNT(*) FROM markets WHERE matched=1 AND active=1 AND flags LIKE '%HIP3%'").fetchone()[0]

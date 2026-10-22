@@ -1,4 +1,6 @@
 """Offline unit tests for symbol normalization, price validation and DB upsert."""
+import pytest
+
 import src.matching as matching
 from src.db import connect
 from src.matching import normalize_symbol, save, validate
@@ -15,6 +17,11 @@ def test_normalize_symbol():
     assert normalize_symbol("WTI") == ("CL", 1.0)
     assert normalize_symbol("xyz:TSLA") == ("TSLA", 1.0)
     assert normalize_symbol("xyz:GOLD") == ("XAU", 1.0)
+
+
+@pytest.fixture(autouse=True)
+def _any_venue(monkeypatch):
+    monkeypatch.setattr(matching, "REQUIRED_VENUE", "")  # fixtures below use Hyperliquid/Lighter pairs
 
 
 def _r(venue, asset, px):
@@ -70,3 +77,15 @@ def test_class_from_matched_rows_and_power_of_ten_rescue():
     lt_spx = rows[("lighter", "US500")]
     assert lt_spx["matched"] == 1 and lt_spx["multiplier"] == 10.0 and "SCALE=10" in lt_spx["flags"]
     assert abs(lt_spx["unit_price"] - 772.1) < 1e-9
+
+
+def test_required_venue_keeps_only_assets_tradable_on_it(monkeypatch):
+    monkeypatch.setattr(matching, "REQUIRED_VENUE", "variational")
+    rows = validate([_r("hyperliquid", "AAA", 1.0), _r("lighter", "AAA", 1.0),
+                     _r("hyperliquid", "BBB", 1.0), _r("lighter", "BBB", 1.0), _r("variational", "BBB", 1.0),
+                     _r("hyperliquid", "CCC", 1.0), _r("lighter", "CCC", 1.0), _r("variational", "CCC", 2.0)])
+    m = {(r["venue"], r["asset"]): r for r in rows}
+    assert m[("hyperliquid", "AAA")]["matched"] == 0 and "PRICE_MISMATCH" not in m[("hyperliquid", "AAA")]["flags"]
+    assert all(m[(v, "BBB")]["matched"] == 1 for v in ("hyperliquid", "lighter", "variational"))
+    assert all(m[(v, "CCC")]["matched"] == 0 for v in ("hyperliquid", "lighter", "variational"))
+    assert "PRICE_MISMATCH" in m[("variational", "CCC")]["flags"]

@@ -7,6 +7,8 @@ VAR_RATE_SOURCE = os.environ.get("VAR_RATE_SOURCE", "pre")  # 'pre' or 'post'; s
 VAR_WINDOW_S = int(os.environ.get("VAR_WINDOW_S", "900"))
 # Hyperliquid HIP-3 builder dexes to include (comma list). Each deployer runs its own oracle: allowlist only trusted ones.
 HIP3_DEXES = [d.strip() for d in os.environ.get("HIP3_DEXES", "xyz").split(",") if d.strip()]
+# Every tracked pair must have one leg on this venue (empty = all cross-venue pairs).
+REQUIRED_VENUE = os.environ.get("REQUIRED_VENUE", "variational").strip()
 
 # Signal economics
 MIN_APY_1X = float(os.environ.get("MIN_APY_1X", "0.05"))  # minimum funding APY at 1x
