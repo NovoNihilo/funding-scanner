@@ -69,13 +69,16 @@ def test_capture_schedule_adds_pre_settlement_captures():
     assert upcoming_settlements(conn, 1000) == [1200, 3600]
 
 
-def test_housekeeping_prunes_old_snapshots_only():
+def test_housekeeping_prunes_old_snapshots_runs_and_events():
     conn = connect(":memory:")
     now = 10 * 86400
     _snap(conn, now - 4 * 86400, now, 1e-5)
     _snap(conn, now - 3600, now, 1e-5)
     conn.execute("INSERT INTO runs (job, started_at) VALUES ('x', ?)", (now - 40 * 86400,))
-    assert housekeeping(conn, now) == {"snapshots_pruned": 1, "runs_pruned": 1}
+    for ts in (now - 40 * 86400, now - 3600):
+        conn.execute("INSERT INTO signal_events (pair_id, ts, event, to_status) VALUES ('p', ?, 'STATUS', 'X')", (ts,))
+    assert housekeeping(conn, now) == {"snapshots_pruned": 1, "runs_pruned": 1, "events_pruned": 1}
+    assert conn.execute("SELECT COUNT(*) FROM signal_events").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM var_snapshots").fetchone()[0] == 1
 
 

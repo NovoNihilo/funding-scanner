@@ -10,6 +10,7 @@ VAR_PRE_CAPTURE_S = [int(x) for x in os.environ.get("VAR_PRE_CAPTURE_S", "180,90
 VAR_LATE_WINDOW_S = int(os.environ.get("VAR_LATE_WINDOW_S", "3600"))  # fallback: newest snapshot within this window
 VAR_SNAPSHOT_KEEP_DAYS = float(os.environ.get("VAR_SNAPSHOT_KEEP_DAYS", "3"))
 RUNS_KEEP_DAYS = float(os.environ.get("RUNS_KEEP_DAYS", "30"))
+EVENTS_KEEP_DAYS = float(os.environ.get("EVENTS_KEEP_DAYS", "30"))  # signal status-change history
 # Dashboard: served on localhost only, reached through an SSH tunnel (deploy/dashboard.ps1)
 DASHBOARD_HOST = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
 DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8765"))

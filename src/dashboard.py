@@ -1,23 +1,65 @@
-"""Read-only HTML dashboard, rendered from the database on every request.
-Served on localhost only (DASHBOARD_HOST); open it through the SSH tunnel: deploy/dashboard.ps1."""
+"""Read-only dashboard, rendered from the database on every request.
+Served on localhost only (DASHBOARD_HOST); open it through the SSH tunnel: deploy/dashboard.ps1.
+Routes:  /                 the page (tabs: Opportunities, Watchlist, Health, Activity)
+         /api/pair?id=...  JSON for one pair's detail panel (hourly series, legs, costs, flags explained)"""
 import html
 import json
 import os
+import re
 import shutil
 import time
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
 
-from src.config import APY_BASIS, DB_PATH, HOLD_HORIZON_H, MIN_APY_1X, PRIMARY_SIZE, REQUIRED_VENUE
+from src.config import (APY_BASIS, DB_PATH, HOLD_HORIZON_H, MAX_LEVERAGE_CAP, MIN_APY_1X, PRIMARY_SIZE,
+                        REQUIRED_VENUE, SIGNAL_LOOKBACK_DAYS, TERMINATE_AFTER)
 from src.db import connect
-from src.funding import completeness
+from src.funding import completeness, upcoming_settlements
+from src.signals import _load, _normal_interval, build_periods, lifecycle, mark_anomalies, var_hourly
 
 HOUR = 3600
-LABEL = {"hyperliquid": "HL", "lighter": "LT", "variational": "VAR"}
-HIDDEN_FLAGS = {"ESTIMATED_DATA", "TOS_RISK"}  # TOS_RISK applies to every Variational pair: shown once in the header
-SZ = str(int(PRIMARY_SIZE))
+VENUE = {"hyperliquid": ("HL", "Hyperliquid"), "lighter": ("LT", "Lighter"), "variational": ("VAR", "Variational")}
+STATUS = {"QUALIFIED": "Qualified", "EMERGING": "Emerging", "SUSPENDED": "Suspended", "MONITORING": "Monitoring",
+          "TERMINATED": "Terminated"}
 STATUS_ORDER = {"QUALIFIED": 0, "EMERGING": 1, "SUSPENDED": 2, "MONITORING": 3, "TERMINATED": 4}
-TREND = {"UP": ("&#9650; up", "t-up"), "DOWN": ("&#9660; down", "t-down"), "STABLE": ("&#9644; stable", "t-flat")}
+HIDDEN_FLAGS = {"ESTIMATED_DATA", "TOS_RISK"}  # true for every Variational pair: explained once, not per row
+SZ = str(int(PRIMARY_SIZE))
+APY_FACTOR = 8760 / 2 if APY_BASIS == "capital" else 8760  # hourly net -> APY at 1x
+SPARK_H = 48
+WATCH_ROWS = 60
+
+FLAG_TEXT = {
+    "DIVIDEND_UNKNOWN": "A stock or commodity leg trades on Lighter or a Hyperliquid builder market. Neither "
+                        "publishes how dividends are handled, so a dividend can move price or funding unexpectedly.",
+    "DIV_IMMINENT": "Variational has shortened this market's funding interval, which it does around a dividend. "
+                    "Expect a one-off price adjustment.",
+    "EARLY_APY": "Under 24h of comparable history, so the APY is the average so far, not the conservative 48h/7d rate.",
+    "STRESS_DEFAULT": "No price history yet, so the leverage cap assumes a 30% adverse daily move.",
+    "NO_DEPTH": f"The order book is too thin to fill ${PRIMARY_SIZE:,.0f} per leg.",
+    "Q_HIP3_FEE_EST": "Hyperliquid builder-market fees vary by deployer; costs assume twice the base fee.",
+    "Q_STALE_QUOTES": "Variational's quote is over 10 minutes old, so its cost estimate is doubled.",
+    "Q_NO_QUOTES": "Variational returned no quote for this size.",
+}
+FLAG_PREFIX = {
+    "DIV_EXCLUDED=": "{n} hour(s) inside a Variational dividend window are left out of the averages.",
+    "ANOMALY_EXCLUDED=": "{n} extreme one-off hour(s) are left out of the averages.",
+}
+BLOCK_TEXT = {"REDUCE_ONLY": "is reduce-only: new positions can't be opened",
+              "HIDDEN": "is hidden by the venue", "PREIPO": "is a pre-IPO market with no regular funding",
+              "NO_FUNDING": "has no funding"}
+REASON_RULES = [
+    (r"^APY 1x ([\d.]+%) < (\d+%)$", "APY {0} is under the {1} minimum"),
+    (r"^run APY 1x ([\d.]+%) < (\d+%)$", "APY so far ({0}) is under the {1} minimum"),
+    (r"^conservative funding <= 0$", "Not profitable over 48h / 7d"),
+    (r"^run funding <= 0$", "Current run isn't profitable"),
+    (r"^consistency: positive share < (\d+%) \(48h\)$", "Profitable in under {0} of hours (48h)"),
+    (r"^consistency: positive share < (\d+%) \(run\)$", "Profitable in under {0} of hours so far"),
+    (r"^median hourly net <= 0 \(48h\)$", "The typical hour isn't profitable (48h)"),
+    (r"^coverage (\d+%) < (\d+%) \((24h|run)\)$", "Only {0} of hours have data"),
+    (r"^stale data$", "No fresh data for 3h+"),
+    (r"^(hyperliquid|lighter|variational) (\w+)$", "{0} market {1}"),
+]
 
 
 # ---------------- data ----------------
@@ -85,11 +127,128 @@ def health(conn, now, db_path=None):
         issues.append(("WARN", f"low disk space: {free / 2**30:.1f} GB free"))
     levels = {lvl for lvl, _ in issues}
     status = "FAIL" if "FAIL" in levels else ("WARN" if "WARN" in levels else "OK")
-    sig = _last_run(conn, "signals")
+    upcoming = upcoming_settlements(conn, now)
     return {"status": status, "issues": issues, "snap_age": snap_age, "sync": sync, "sync_age": sync_age,
-            "signals_run": sig, "cov24": cov24, "cov72": cov72, "venues": venues,
+            "cov24": cov24, "cov72": cov72, "venues": venues, "next_settlement": upcoming[0] if upcoming else None,
             "uptime": now - starts[0] if starts else None, "restarts_24h": restarts_24h,
             "db_mb": db_bytes / 2**20, "free_gb": free / 2**30 if free is not None else None}
+
+
+def _legs(conn, row):
+    q = "SELECT * FROM markets WHERE venue=? AND symbol=?"
+    return (conn.execute(q, (row["long_venue"], row["long_symbol"])).fetchone(),
+            conn.execute(q, (row["short_venue"], row["short_symbol"])).fetchone())
+
+
+def pair_series(conn, row, hours=168, cache=None):
+    """Hourly series for one stored signal, built exactly like the signal engine (same lookback, held-forward
+    Variational rate, dividend and anomaly exclusions). Returns (points, run_start, kills); each point is
+    {t, net, ex, l, s} with net and per-leg rates per hour (None = missing)."""
+    cache = {} if cache is None else cache
+    now = row["updated_at"]
+    since = int(now - SIGNAL_LOOKBACK_DAYS * 86400 - 8 * HOUR)
+    lg, sh = _legs(conn, row)
+    if lg is None or sh is None:
+        return [], None, []
+
+    def rates(m):
+        key = (m["venue"], m["symbol"])
+        if key not in cache:
+            cache[key] = _load(conn, m["venue"], m["symbol"], since)
+        return cache[key]
+
+    lr, sr = rates(lg), rates(sh)
+    var_leg = "long" if lg["venue"] == "variational" else ("short" if sh["venue"] == "variational" else None)
+    normal = None
+    if var_leg:
+        vm, vr = (lg, lr) if var_leg == "long" else (sh, sr)
+        normal = _normal_interval(vr) if vm["asset_class"] == "tradfi" else None
+    periods = [p for p in build_periods(lr, sr, var_leg, normal) if p["end"] <= now]
+    mark_anomalies(periods)
+    run_start, _, kills, _ = lifecycle(periods)
+
+    def leg_rate(r, is_var, t):
+        if is_var:
+            keys = sorted(r)
+            v = var_hourly(r, keys, t) if keys else None
+            return v[0] if v else None
+        return r[t][0] if t in r else None
+
+    lo = now - hours * HOUR
+    pts = []
+    for p in periods:
+        if p["end"] <= lo:
+            continue
+        ex = "dividend" if "DIVIDEND" in p["tags"] else ("anomaly" if "ANOMALY" in p["tags"] else None)
+        pts.append({"t": p["end"], "net": p["net"], "ex": ex,
+                    "l": leg_rate(lr, var_leg == "long", p["end"]), "s": leg_rate(sr, var_leg == "short", p["end"])})
+    return pts, run_start, [k for k in kills if k > lo]
+
+
+def flag_notes(flags):
+    out = []
+    for f in flags:
+        if not f or f in HIDDEN_FLAGS:
+            continue
+        text = FLAG_TEXT.get(f)
+        for prefix, tmpl in FLAG_PREFIX.items():
+            if f.startswith(prefix):
+                text = tmpl.format(n=f[len(prefix):])
+        m = re.match(r"^(HYP|LIG|VAR)_(\w+)$", f)
+        if m and m.group(2) in BLOCK_TEXT:
+            text = f"The {dict(HYP='Hyperliquid', LIG='Lighter', VAR='Variational')[m.group(1)]} market " \
+                   f"{BLOCK_TEXT[m.group(2)]}."
+        out.append({"code": f, "text": text or f})
+    return out
+
+
+def humanize(reason):
+    for pat, tmpl in REASON_RULES:
+        m = re.match(pat, reason)
+        if m:
+            g = list(m.groups())
+            if tmpl.startswith("{0} market"):
+                g = [VENUE.get(g[0], (g[0], g[0].title()))[1], BLOCK_TEXT.get(g[1], g[1].lower().replace("_", " "))]
+            return tmpl.format(*g)
+    return reason
+
+
+def leverage_note(row, lg, sh, m):
+    venue_caps = [v for v in ((lg["max_leverage"] if lg else None), (sh["max_leverage"] if sh else None)) if v]
+    venue = min(venue_caps) if venue_caps else None
+    lev = int(row["max_lev"] or 1)
+    move = m.get("stress_move")
+    if m.get("stress_lev") is not None and lev >= int(m["stress_lev"]) and (venue is None or m["stress_lev"] < venue) \
+            and m["stress_lev"] < MAX_LEVERAGE_CAP:
+        return (f"Capped at {lev}x by the stress test: neither leg may be liquidated by a {move:.0%} adverse move in "
+                f"24h (the 99th-percentile daily move plus a 25% buffer), rebalancing once a day.")
+    if venue is not None and venue <= MAX_LEVERAGE_CAP:
+        return f"Capped at {lev}x by the venues' own maximum leverage."
+    return f"Capped at {lev}x by the scanner's {MAX_LEVERAGE_CAP:.0f}x ceiling."
+
+
+def pair_detail(conn, pair_id):
+    row = conn.execute("SELECT * FROM signals WHERE pair_id=?", (pair_id,)).fetchone()
+    if row is None:
+        return None
+    lg, sh = _legs(conn, row)
+    m = json.loads(row["metrics"] or "{}")
+    pts, run_start, kills = pair_series(conn, row)
+    cls = (lg["asset_class"] if lg else None) or (sh["asset_class"] if sh else None)
+    return {
+        "pair_id": pair_id, "asset": row["asset"], "class": cls, "status": row["status"],
+        "status_label": STATUS.get(row["status"], row["status"]), "cohort": row["cohort"], "age_h": row["age_h"],
+        "long": {"venue": row["long_venue"], "badge": VENUE[row["long_venue"]][0],
+                 "name": VENUE[row["long_venue"]][1], "symbol": row["long_symbol"]},
+        "short": {"venue": row["short_venue"], "badge": VENUE[row["short_venue"]][0],
+                  "name": VENUE[row["short_venue"]][1], "symbol": row["short_symbol"]},
+        "apy_1x": row["apy_1x"], "apy_max": row["apy_max"], "max_lev": row["max_lev"], "metrics": m,
+        "flags": flag_notes((row["flags"] or "").split(",")),
+        "reasons": [humanize(r) for r in json.loads(row["reasons"] or "[]")],
+        "leverage_note": leverage_note(row, lg, sh, m), "series": pts, "run_start": run_start, "kills": kills,
+        "updated_at": row["updated_at"], "apy_factor": APY_FACTOR, "min_apy": MIN_APY_1X,
+        "terminate_after": TERMINATE_AFTER, "hold_h": HOLD_HORIZON_H,
+    }
 
 
 # ---------------- formatting ----------------
@@ -105,8 +264,15 @@ def age(s):
     return f"{s}s" if s < 120 else (f"{s // 60}m" if s < 7200 else (f"{s // 3600}h" if s < 172800 else f"{s // 86400}d"))
 
 
-def pct(x):
-    return "n/a" if x is None else f"{x * 100:.1f}%"
+def until(s):
+    if s is None or s < 0:
+        return "n/a"
+    h, rem = divmod(int(s), 3600)
+    return f"{h}h {rem // 60}m" if h else f"{rem // 60}m"
+
+
+def pct(x, digits=1):
+    return "n/a" if x is None else f"{x * 100:.{digits}f}%"
 
 
 def usd(x):
@@ -120,145 +286,191 @@ def hrs(h):
 def ts_tag(t):
     if not t:
         return "n/a"
-    utc = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(t))
-    return f'<time data-ts="{int(t)}">{utc}</time>'
-
-
-def leg(venue, symbol):
-    return f'<span class="v v-{esc(venue[:3])}">{esc(LABEL.get(venue, venue))}</span> {esc(symbol)}'
-
-
-def td(text, sort=None, cls=""):
-    attr = f' data-v="{sort}"' if sort is not None else ""
-    return f'<td class="{cls}"{attr}>{text}</td>'
+    return f'<time data-ts="{int(t)}">{time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(t))}</time>'
 
 
 def num(x, default=-1e18):
     return default if x is None else x
 
 
-def trend_td(m):
-    t = m.get("trend")
-    if t not in TREND:
-        return td('<span class="muted">n/a</span>', -1e18)
-    label, cls = TREND[t]
+def badge(venue):
+    short, name = VENUE.get(venue, (venue, venue))
+    return f'<abbr class="vb vb-{esc(short.lower())}" title="{esc(name)}">{esc(short)}</abbr>'
+
+
+def sparkline(pts, hours=SPARK_H):
+    """Inline SVG of the last `hours` hourly nets: bars up (earning) / down (paying), gaps where data is missing."""
+    pts = pts[-hours:]
+    vals = [abs(p["net"]) for p in pts if p["net"] is not None and not p["ex"]]
+    top = max(vals) if vals else 0
+    w, h, bw = hours * 3, 24, 2
+    if not pts or not top:
+        return f'<svg class="spark" viewBox="0 0 {w} {h}" aria-hidden="true"><line x1="0" y1="12" x2="{w}" y2="12"/></svg>'
+    x0 = w - len(pts) * 3
+    bars, pos = [], 0
+    for i, p in enumerate(pts):
+        x = x0 + i * 3
+        if p["net"] is None:
+            bars.append(f'<rect class="sk-miss" x="{x}" y="11.5" width="{bw}" height="1"/>')
+            continue
+        v = max(-1.0, min(1.0, p["net"] / top))
+        bh = max(1.0, abs(v) * 11)
+        cls = "sk-ex" if p["ex"] else ("sk-pos" if v > 0 else "sk-neg")
+        pos += v > 0
+        y = 12 - bh if v > 0 else 12
+        bars.append(f'<rect class="{cls}" x="{x}" y="{y:.1f}" width="{bw}" height="{bh:.1f}"/>')
+    label = f"Last {len(pts)} hours: profitable in {pos}"
+    return (f'<svg class="spark" viewBox="0 0 {w} {h}" role="img" aria-label="{esc(label)}">'
+            f'<line class="sk-zero" x1="0" y1="12" x2="{w}" y2="12"/>{"".join(bars)}</svg>')
+
+
+# ---------------- page sections ----------------
+
+def trade_cell(r):
+    return (f'<div class="trade"><span class="side">Long</span>{badge(r["long_venue"])}'
+            f'<span class="sym">{esc(r["long_symbol"])}</span>'
+            f'<span class="side">Short</span>{badge(r["short_venue"])}<span class="sym">{esc(r["short_symbol"])}</span></div>')
+
+
+TREND = {"UP": ("&#9650;", "Rising", "t-up"), "DOWN": ("&#9660;", "Falling", "t-down"),
+         "STABLE": ("&#9644;", "Stable", "t-flat")}
+
+
+def trend_cell(m):
+    t = TREND.get(m.get("trend"))
+    if not t:
+        return '<td data-v="-1e18" class="c-trend"><span class="muted">Not enough data</span></td>'
     d = m.get("trend_delta_apy") or 0
-    return td(f'<span class="{cls}" title="APY 1x, last 12h vs prior 24h">{label} {d * 100:+.1f}</span>', d)
+    return (f'<td data-v="{d}" class="c-trend"><span class="{t[2]}"><span aria-hidden="true">{t[0]}</span> {t[1]}</span>'
+            f'<span class="sub">{d * 100:+.1f} pts</span></td>')
 
 
-# ---------------- sections ----------------
-
-def pair_table(rows, classes, with_reasons, empty):
-    head = ("<tr><th>Asset</th><th>Class</th><th>Long</th><th>Short</th><th>Status</th><th>Cohort</th>"
-            "<th>Age</th><th>APY 1x</th><th>APY range</th><th>Trend</th><th>Cost (taker / maker)</th>"
-            "<th>Payback at current rate (t / m)</th>"
-            f"<th>Net 24h</th><th>Net {HOLD_HORIZON_H:.0f}h</th><th>Basis</th><th>Flags{' / reasons' if with_reasons else ''}</th></tr>")
-    if not rows:
-        return f'<p class="empty">{esc(empty)}</p>'
+def pair_rows(rows, classes, series, with_reasons):
     out = []
     for r in rows:
         m = json.loads(r["metrics"] or "{}")
         c = (m.get("costs") or {}).get(SZ, {})
         ok = c.get("status") == "OK"
         cls = classes.get(r["asset"], "unknown")
-        flags = [f for f in (r["flags"] or "").split(",") if f and f not in HIDDEN_FLAGS]
-        notes = flags + (json.loads(r["reasons"] or "[]") if with_reasons else [])
-        st = r["status"]
         lev = int(r["max_lev"] or 1)
-        out.append(
-            f'<tr data-class="{esc(cls)}" data-text="{esc((r["asset"] + " " + r["long_symbol"] + " " + r["short_symbol"]).lower())}">'
-            + td(f"<b>{esc(r['asset'])}</b>", r["asset"])
-            + td(esc("RWA" if cls == "tradfi" else cls), cls)
-            + td(leg(r["long_venue"], r["long_symbol"]), r["long_venue"])
-            + td(leg(r["short_venue"], r["short_symbol"]), r["short_venue"])
-            + td(f'<span class="chip s-{esc(st.lower())}">{esc(st)}</span>', STATUS_ORDER.get(st, 9))
-            + td(esc(r["cohort"] or "-"), r["age_h"] or 0)
-            + td(f"{r['age_h'] or 0:.0f}h", r["age_h"] or 0, "n")
-            + td(pct(r["apy_1x"]), num(r["apy_1x"]), "n")
-            + td(f"{pct(r['apy_1x'])} &ndash; {pct(r['apy_max'])} @ {lev}x", num(r["apy_max"]), "n")
-            + trend_td(m)
-            + td(f"{usd(c.get('cost_usd'))} / {usd(c.get('cost_usd_maker'))}" if ok else esc(c.get("status", "n/a")),
-                 num(c.get("cost_usd"), 1e18), "n")
-            + td(f"{hrs(c.get('payback_h'))} / {hrs(c.get('payback_h_maker'))}" if ok else "n/a",
-                 num(c.get("payback_h"), 1e18), "n")
-            + td(usd(c.get("net24_usd")), num(c.get("net24_usd")), "n")
-            + td(usd(c.get("net_hold_usd")), num(c.get("net_hold_usd")), "n")
-            + td(f"{c['basis_bps']:+.1f}bp" if ok else "n/a", c.get("basis_bps", 0) if ok else 0, "n")
-            + td('<span class="notes">' + esc("; ".join(notes)) + "</span>", None))
-    return f'<div class="scroll"><table class="sortable">{head}{"".join(out)}</table></div>'
+        text = " ".join([r["asset"], r["long_symbol"], r["short_symbol"], r["long_venue"], r["short_venue"]]).lower()
+        payback = (f'<b>{hrs(c.get("payback_h_maker"))}</b> maker<span class="sub">{hrs(c.get("payback_h"))} taker</span>'
+                   if ok else f'<span class="muted">{"Costs pending" if c.get("status") in (None, "MISSING") else "Thin book"}</span>')
+        cells = [
+            f'<td class="c-asset" data-v="{esc(r["asset"])}"><button class="open" data-pair="{esc(r["pair_id"])}">'
+            f'{esc(r["asset"])}</button><span class="sub">{"RWA" if cls == "tradfi" else "Crypto"}</span></td>',
+            f'<td class="c-trade" data-v="{esc(r["long_venue"])}">{trade_cell(r)}</td>',
+            f'<td class="c-apy n" data-v="{num(r["apy_1x"])}"><b>{pct(r["apy_1x"])}</b>'
+            f'<span class="sub">up to {pct(r["apy_max"])} at {lev}x</span></td>',
+            trend_cell(m),
+            f'<td class="c-pay n" data-v="{num(c.get("payback_h_maker"), 1e18) if ok else 1e18}">{payback}</td>',
+            f'<td class="c-net n" data-v="{num(c.get("net_hold_usd"))}">{usd(c.get("net_hold_usd"))}</td>',
+            f'<td class="c-age n" data-v="{r["age_h"] or 0}">{r["age_h"] or 0:.0f}h'
+            f'<span class="sub">{esc((r["cohort"] or "").title() if r["status"] in ("QUALIFIED", "EMERGING", "SUSPENDED") else "")}</span></td>',
+            f'<td class="c-spark">{sparkline(series.get(r["pair_id"], []))}</td>',
+        ]
+        if with_reasons:
+            reasons = [humanize(x) for x in json.loads(r["reasons"] or "[]")]
+            cells.append(f'<td class="c-why"><span class="chip s-{esc(r["status"].lower())}">'
+                         f'{esc(STATUS.get(r["status"], r["status"]))}</span>'
+                         f'<span class="why">{esc(reasons[0] if reasons else "")}</span></td>')
+        out.append(f'<tr data-pair="{esc(r["pair_id"])}" data-class="{esc(cls)}" data-text="{esc(text)}">'
+                   + "".join(cells) + "</tr>")
+    return "".join(out)
 
 
-def warming_section(rows):
+def pair_table(rows, classes, series, empty, with_reasons=False):
     if not rows:
-        return ""
-    buckets = Counter()
-    best = 0
-    for r in rows:
-        h = json.loads(r["metrics"] or "{}").get("history_hours")
-        if h is None:
-            buckets["not yet evaluated"] += 1
-            continue
-        best = max(best, h)
-        buckets["0h" if h <= 0 else ("1-7h" if h < 8 else ("8-15h" if h < 16 else "16-23h"))] += 1
-    order = ["0h", "1-7h", "8-15h", "16-23h", "not yet evaluated"]
-    cells = "".join(f'<div class="stat"><span>{esc(k)}</span><b>{buckets[k]}</b></div>' for k in order if buckets[k])
-    return (f'<section><h2>Warming up <small>{len(rows)} pairs without an APY yet</small></h2>'
-            f'<p class="hint">History grows by one hour per hour. A pair shows an early APY after 8h of '
-            f'comparable history and its conservative APY after 24h. Most advanced pair: {best:.0f}h of 24h.</p>'
-            f'<div class="stats">{cells}</div></section>')
+        return f'<p class="empty">{empty}</p>'
+    heads = ["Asset", "Trade", "APY at 1x", "Trend (12h vs 24h)", "Payback of entry + exit", f"Net {HOLD_HORIZON_H / 24:.0f}d",
+             "Run age", f"Last {SPARK_H}h"] + (["Why not yet"] if with_reasons else [])
+    cls = ["c-asset", "c-trade", "c-apy n", "c-trend", "c-pay n", "c-net n", "c-age n", "c-spark"] + \
+          (["c-why"] if with_reasons else [])
+    th = "".join(f'<th class="{c}" scope="col"><button class="sort" data-col="{i}">{h}</button></th>'
+                 if h != f"Last {SPARK_H}h" else f'<th class="{c}" scope="col">{h}</th>'
+                 for i, (h, c) in enumerate(zip(heads, cls)))
+    return (f'<div class="tablewrap"><table class="pairs"><thead><tr>{th}</tr></thead>'
+            f'<tbody>{pair_rows(rows, classes, series, with_reasons)}</tbody></table></div>')
 
 
-def health_section(h, now):
-    rows = "".join(f'<li class="i-{lvl.lower()}"><b>{lvl}</b> {esc(text)}</li>' for lvl, text in h["issues"])
-    if not rows:
-        rows = '<li class="i-ok"><b>OK</b> All collectors are healthy.</li>'
-    c24, c72 = h["cov24"], h["cov72"]
+def health_tab(h, warming):
+    icon = {"FAIL": "&#10007;", "WARN": "!", "INFO": "i"}
+    items = "".join(f'<li class="i-{lvl.lower()}"><span class="ic" aria-hidden="true">{icon[lvl]}</span>'
+                    f'<b>{dict(FAIL="Failing", WARN="Warning", INFO="Note")[lvl]}</b> {esc(text)}</li>'
+                    for lvl, text in h["issues"])
+    if not items:
+        items = '<li class="i-ok"><span class="ic" aria-hidden="true">&#10003;</span><b>Healthy</b> All collectors are running and up to date.</li>'
+    c24, c72, v = h["cov24"], h["cov72"], h["venues"]
     sync = h["sync"]
-    sync_detail = json.loads(sync["detail"] or "{}") if sync else {}
+    detail = json.loads(sync["detail"] or "{}") if sync else {}
     took = (sync["finished_at"] - sync["started_at"]) if sync else None
-    repairs = sum((sync_detail.get(k) or {}).get("gap_repairs", 0) for k in ("hl", "lt"))
-    v = h["venues"]
-    stats = [
-        ("Variational snapshot", f"{age(h['snap_age'])} ago"),
-        ("Var settlements 24h", f"{c24['captured']} / {c24['expected']}"),
-        ("Var settlements 72h", f"{c72['captured']} / {c72['expected']}"),
-        ("Late fallbacks 24h", str(c24["late"])),
-        ("Last sync", f"{age(h['sync_age'])} ago, took {age(took)}"),
-        ("HL markets / gaps", f"{v['hyperliquid']['markets']} / {v['hyperliquid']['gaps']}"),
-        ("LT markets / gaps", f"{v['lighter']['markets']} / {v['lighter']['gaps']}"),
-        ("Gap repairs (last sync)", str(repairs)),
-        ("Worker uptime", age(h["uptime"])),
-        ("Restarts 24h", str(h["restarts_24h"])),
-        ("Database", f"{h['db_mb']:.0f} MB"),
-        ("Disk free", "n/a" if h["free_gb"] is None else f"{h['free_gb']:.1f} GB"),
+    repairs = sum((detail.get(k) or {}).get("gap_repairs", 0) for k in ("hl", "lt"))
+    nxt = h["next_settlement"]
+    groups = [
+        ("Variational", [("Last snapshot", f"{age(h['snap_age'])} ago"),
+                         ("Next settlement", f"in {until(nxt - int(time.time()))}" if nxt else "n/a"),
+                         ("Settlements captured, 24h", f"{c24['captured']} of {c24['expected']}"),
+                         ("Settlements captured, 72h", f"{c72['captured']} of {c72['expected']}"),
+                         ("Late fallbacks, 24h", str(c24["late"]))]),
+        ("Hyperliquid and Lighter", [("Last sync", f"{age(h['sync_age'])} ago, took {age(took)}"),
+                                     ("Hyperliquid markets", f"{v['hyperliquid']['markets']}, {v['hyperliquid']['gaps']} with gaps"),
+                                     ("Lighter markets", f"{v['lighter']['markets']}, {v['lighter']['gaps']} with gaps"),
+                                     ("Gaps repaired, last sync", str(repairs))]),
+        ("Server", [("Worker uptime", age(h["uptime"])), ("Restarts, 24h", str(h["restarts_24h"])),
+                    ("Database", f"{h['db_mb']:.0f} MB"),
+                    ("Disk free", "n/a" if h["free_gb"] is None else f"{h['free_gb']:.1f} GB")]),
     ]
-    cells = "".join(f'<div class="stat"><span>{esc(k)}</span><b>{esc(val)}</b></div>' for k, val in stats)
-    missing = c72["missing"][:20]
+    dl = "".join(f'<div class="group"><h3>{g}</h3><dl>' + "".join(f"<dt>{esc(k)}</dt><dd>{esc(val)}</dd>"
+                                                                  for k, val in rows) + "</dl></div>"
+                 for g, rows in groups)
     miss = ""
-    if missing:
-        items = "".join(f"<li>{esc(s)} at {ts_tag(t)}</li>" for s, t in missing)
-        miss = f'<details><summary>Missed Variational settlements (72h): {len(c72["missing"])}</summary><ul>{items}</ul></details>'
-    return (f'<section class="health h-{h["status"].lower()}"><h2>Health <span class="chip st-{h["status"].lower()}">'
-            f'{h["status"]}</span></h2><ul class="issues">{rows}</ul><div class="stats">{cells}</div>{miss}</section>')
+    if c72["missing"]:
+        li = "".join(f"<li>{esc(s)} at {ts_tag(t)}</li>" for s, t in c72["missing"][:30])
+        miss = (f'<details class="misses"><summary>{len(c72["missing"])} missed Variational settlement(s) in 72h'
+                f'</summary><ul>{li}</ul></details>')
+    warm = ""
+    if warming:
+        b, best = Counter(), 0
+        for r in warming:
+            hh = json.loads(r["metrics"] or "{}").get("history_hours")
+            if hh is None:
+                b["Not evaluated yet"] += 1
+                continue
+            best = max(best, hh)
+            b["No history" if hh <= 0 else ("1-7 hours" if hh < 8 else "8-23 hours")] += 1
+        rows = "".join(f"<dt>{k}</dt><dd>{b[k]} pairs</dd>" for k in ("No history", "1-7 hours", "8-23 hours",
+                                                                       "Not evaluated yet") if b[k])
+        warm = (f'<div class="group"><h3>Pairs still building history</h3><p class="note">A pair shows an early APY '
+                f'after 8 hours of comparable history and its conservative APY after 24. The furthest along has '
+                f'{best:.0f} hours.</p><dl>{rows}</dl></div>')
+    return (f'<ul class="issues">{items}</ul><div class="groups">{dl}{warm}</div>{miss}')
 
 
-def events_section(conn, live):
-    """Real status changes (not first sightings) on pairs that are still tracked."""
+def activity_tab(conn, live):
     rows = [e for e in conn.execute("SELECT * FROM signal_events WHERE from_status IS NOT NULL ORDER BY id DESC "
-                                    "LIMIT 400") if e["pair_id"] in live][:40]
+                                    "LIMIT 600") if e["pair_id"] in live][:60]
     if not rows:
-        return ""
+        return '<p class="empty">No status changes yet. They appear here as pairs emerge, qualify or get killed.</p>'
     out = []
     for e in rows:
         asset, _, legs = e["pair_id"].partition("|")
         lg, _, sh = legs.partition(">")
         lv, _, ls = lg.partition(":")
         sv, _, ss = sh.partition(":")
-        out.append(f"<tr><td>{ts_tag(e['ts'])}</td><td><b>{esc(asset)}</b></td><td>{leg(lv, ls)}</td>"
-                   f"<td>{leg(sv, ss)}</td><td>{esc(e['from_status'] or 'new')} &rarr; <b>{esc(e['to_status'])}</b></td>"
-                   f'<td><span class="notes">{esc(e["detail"])}</span></td></tr>')
-    return ('<section><h2>Recent signal changes</h2><div class="scroll"><table><tr><th>When</th><th>Asset</th>'
-            f'<th>Long</th><th>Short</th><th>Change</th><th>Detail</th></tr>{"".join(out)}</table></div></section>')
+        to = e["to_status"]
+        detail = "; ".join(humanize(x) for x in (e["detail"] or "").split("; ") if x)
+        if to == "TERMINATED":
+            detail = f"Killed after {TERMINATE_AFTER} unprofitable hours in a row"
+        out.append(f'<tr data-pair="{esc(e["pair_id"])}"><td class="when">{ts_tag(e["ts"])}</td>'
+                   f'<td><button class="open" data-pair="{esc(e["pair_id"])}">{esc(asset)}</button></td>'
+                   f'<td><div class="trade"><span class="side">Long</span>{badge(lv)}<span class="sym">{esc(ls)}</span>'
+                   f'<span class="side">Short</span>{badge(sv)}<span class="sym">{esc(ss)}</span></div></td>'
+                   f'<td>{esc(STATUS.get(e["from_status"], e["from_status"]))} to '
+                   f'<span class="chip s-{esc(to.lower())}">{esc(STATUS.get(to, to))}</span></td>'
+                   f'<td class="muted">{esc(detail)}</td></tr>')
+    return ('<div class="tablewrap"><table class="events"><thead><tr><th scope="col">When</th><th scope="col">Asset</th>'
+            '<th scope="col">Trade</th><th scope="col">Change</th><th scope="col">Detail</th></tr></thead>'
+            f'<tbody>{"".join(out)}</tbody></table></div>')
 
 
 def build_page(conn, now=None, db_path=None):
@@ -270,106 +482,323 @@ def build_page(conn, now=None, db_path=None):
     qualified = sorted((r for r in sigs if r["status"] == "QUALIFIED"),
                        key=lambda r: -num(json.loads(r["metrics"] or "{}").get("rank_net_hold_usd")))
     emerging = sorted((r for r in sigs if r["status"] == "EMERGING"), key=lambda r: -num(r["apy_1x"]))
-    watch = sorted((r for r in sigs if r["status"] not in ("QUALIFIED", "EMERGING") and r["apy_1x"] is not None),
-                   key=lambda r: -r["apy_1x"])[:40]
+    watch = sorted((r for r in sigs if r["status"] not in ("QUALIFIED", "EMERGING") and (r["apy_1x"] or 0) > 0),
+                   key=lambda r: -r["apy_1x"])[:WATCH_ROWS]
     warming = [r for r in sigs if r["apy_1x"] is None and r["status"] != "TERMINATED"]
-    counts = Counter(r["status"] for r in sigs)
+    cache, series = {}, {}
+    for r in qualified + emerging + watch:
+        series[r["pair_id"]] = pair_series(conn, r, SPARK_H, cache)[0]
     h = health(conn, now, db_path)
-    tos = ('<p class="tos">Every pair has a Variational leg. Variational&#39;s Terms of Use (&sect;4.A.xv(6)) prohibit '
-           'arbitrage between Variational and other platforms (TOS_RISK). Read-only scanner; not trading advice.</p>'
-           if REQUIRED_VENUE == "variational" else "")
-    summary = " &middot; ".join(esc(f"{k.lower()} {counts[k]}") for k in STATUS_ORDER if counts[k])
+    hl = {"OK": ("ok", "&#10003;", "Healthy"), "WARN": ("warn", "!", "Needs attention"),
+          "FAIL": ("fail", "&#10007;", "Failing")}[h["status"]]
+    best = qualified[0] if qualified else None
+    if best:
+        lead = (f"{len(qualified)} qualified and {len(emerging)} emerging. The top qualified pair is "
+                f"<b>{esc(best['asset'])}</b> at {pct(best['apy_1x'])} APY at 1x.")
+    elif emerging:
+        lead = f"No qualified pairs yet, {len(emerging)} emerging. Pairs qualify after 24 profitable hours."
+    else:
+        lead = "Nothing qualifies right now. Pairs appear here after 8 profitable hours and qualify after 24."
+    tos = ("Every pair has one leg on Variational, whose terms of use (section 4.A.xv(6)) prohibit arbitrage between "
+           "Variational and other platforms. Variational rates are estimated from live snapshots. "
+           "This page is read-only and isn't trading advice." if REQUIRED_VENUE == "variational" else
+           "This page is read-only and isn't trading advice.")
+    opp = (f'<p class="lead">{lead}</p>'
+           f'<section aria-labelledby="h-q"><div class="sechead"><h2 id="h-q">Qualified</h2><p>Profitable for 24 hours or '
+           f'more and passing every check. Ranked by expected net over {HOLD_HORIZON_H / 24:.0f} days at '
+           f'${PRIMARY_SIZE:,.0f} per leg after taker costs.</p></div>'
+           + pair_table(qualified, classes, series, "No qualified pairs right now.") + '</section>'
+           f'<section aria-labelledby="h-e"><div class="sechead"><h2 id="h-e">Emerging</h2><p>Profitable for 8 to 24 '
+           f'hours and passing the same checks on the run so far. Early numbers move more; consider a smaller size.'
+           f'</p></div>' + pair_table(emerging, classes, series, "No emerging pairs right now.") + '</section>'
+           f'<p class="fine">{tos}</p>')
+    wl = (f'<div class="sechead"><h2>Watchlist</h2><p>The {len(watch)} highest-APY profitable-direction pairs that '
+          f'aren\'t qualified or emerging yet, with what is holding each one back.</p></div>'
+          + pair_table(watch, classes, series, "No other pairs have an APY yet.", with_reasons=True))
+    tabs = [("opportunities", "Opportunities", len(qualified) + len(emerging)), ("watchlist", "Watchlist", len(watch)),
+            ("health", "Health", None), ("activity", "Activity", None)]
+    tablist = "".join(f'<button role="tab" id="t-{k}" aria-controls="tab-{k}" data-tab="{k}" aria-selected="false">'
+                      f'{label}{f" <span class=count>{n}</span>" if n is not None else ""}</button>'
+                      for k, label, n in tabs)
     body = f"""
-<header>
-  <div><h1>Funding scanner</h1>
-  <p class="sub">Signals as of {ts_tag(asof)} &middot; page built {ts_tag(now)} &middot; {len(sigs)} pairs: {summary}</p>
-  <p class="sub">APY on {esc(APY_BASIS)} &middot; minimum {MIN_APY_1X:.0%} at 1x &middot; costs at ${PRIMARY_SIZE:,.0f} per leg &middot;
-  ranking = expected net over {HOLD_HORIZON_H:.0f}h after taker costs &middot;
-  a run is killed after 3 non-profitable hours</p></div>
-  <div class="controls"><input id="q" type="search" placeholder="Filter asset or market">
-  <select id="cls"><option value="">All classes</option><option value="crypto">Crypto</option>
-  <option value="tradfi">RWA</option></select></div>
+<header class="top">
+  <div class="brand"><h1>Funding scanner</h1>
+    <p>Signals updated {ts_tag(asof)} &#8211; checked hourly</p></div>
+  <button class="health-pill hp-{hl[0]}" data-goto="health"><span class="ic" aria-hidden="true">{hl[1]}</span>{hl[2]}</button>
 </header>
-{tos}
-{health_section(h, now)}
-<section><h2>Qualified <small>{len(qualified)}</small></h2>
-{pair_table(qualified, classes, False, "No qualified pairs right now.")}</section>
-<section><h2>Emerging <small>{len(emerging)} &middot; profitable 8-24h, passing the gates so far</small></h2>
-{pair_table(emerging, classes, False, "No emerging pairs right now.")}</section>
-<section><h2>Watchlist <small>top {len(watch)} others by APY</small></h2>
-{pair_table(watch, classes, True, "No pairs with an APY yet.")}</section>
-{warming_section(warming)}
-{events_section(conn, {r["pair_id"] for r in sigs})}
-"""
+<nav class="bar">
+  <div role="tablist" aria-label="Sections">{tablist}</div>
+  <div class="filters"><label class="visually-hidden" for="q">Filter</label>
+    <input id="q" type="search" placeholder="Filter by asset or market" autocomplete="off">
+    <label class="visually-hidden" for="cls">Asset class</label>
+    <select id="cls"><option value="">All assets</option><option value="crypto">Crypto</option><option value="tradfi">RWA</option></select>
+  </div>
+</nav>
+<main>
+  <div role="tabpanel" id="tab-opportunities" aria-labelledby="t-opportunities">{opp}</div>
+  <div role="tabpanel" id="tab-watchlist" aria-labelledby="t-watchlist" hidden>{wl}</div>
+  <div role="tabpanel" id="tab-health" aria-labelledby="t-health" hidden><div class="sechead"><h2>Health</h2>
+    <p>Whether every collector is running and the data is complete.</p></div>{health_tab(h, warming)}</div>
+  <div role="tabpanel" id="tab-activity" aria-labelledby="t-activity" hidden><div class="sechead"><h2>Activity</h2>
+    <p>Status changes on tracked pairs, newest first.</p></div>{activity_tab(conn, {r["pair_id"] for r in sigs})}</div>
+</main>
+<div class="scrim" hidden></div>
+<aside class="drawer" aria-label="Pair detail" aria-hidden="true" tabindex="-1">
+  <button class="close" aria-label="Close detail">&#10005;</button><div class="drawer-body"></div>
+</aside>"""
     return PAGE.replace("{{BODY}}", body)
 
 
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Funding Scanner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#f6f7f9;--card:#fff;--fg:#16181d;--muted:#5f6673;--line:#e3e6eb;--ok:#137a3a;--warn:#9a6200;--fail:#b42318;
---okbg:#e7f6ec;--warnbg:#fff4de;--failbg:#fde8e6;--accent:#2f5bd3}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#171a20;--fg:#e8eaee;--muted:#9aa3b2;--line:#272b33;
---ok:#4cc77a;--warn:#e7b04a;--fail:#ff7a6b;--okbg:#13291c;--warnbg:#2e2412;--failbg:#33191a;--accent:#7a9bff}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
-font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:16px;max-width:1500px;margin:auto}
-header{display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:flex-end}
-h1{margin:0;font-size:22px}h2{font-size:16px;margin:0 0 10px}h2 small{color:var(--muted);font-weight:400}
-.sub{margin:2px 0;color:var(--muted)}.controls{display:flex;gap:8px}
-input,select{font:inherit;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg)}
-section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin:14px 0}
-.tos{margin:12px 0 0;padding:8px 12px;border-radius:8px;background:var(--warnbg);color:var(--warn)}
-.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;white-space:nowrap}
-th,td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
-th{position:sticky;top:0;background:var(--card);color:var(--muted);font-weight:600;cursor:pointer;user-select:none}
-td.n{text-align:right;font-variant-numeric:tabular-nums}.notes{color:var(--muted);white-space:normal;display:inline-block;min-width:360px;max-width:560px}
-.chip{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;font-weight:600;background:var(--line)}
-.s-qualified,.st-ok{background:var(--okbg);color:var(--ok)}.s-suspended,.st-warn{background:var(--warnbg);color:var(--warn)}
-.s-terminated,.st-fail{background:var(--failbg);color:var(--fail)}
-.v{font-size:11px;font-weight:700;padding:0 5px;border-radius:4px;border:1px solid var(--line);color:var(--muted)}
-.v-var{color:var(--accent);border-color:var(--accent)}.s-emerging{background:var(--line);color:var(--accent)}
-.t-up{color:var(--ok)}.t-down{color:var(--fail)}.t-flat,.muted{color:var(--muted)}
-.stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin-top:10px}
-.stat{border:1px solid var(--line);border-radius:8px;padding:8px}.stat span{display:block;color:var(--muted);font-size:12px}
-.issues{list-style:none;padding:0;margin:0}.issues li{padding:4px 0}.i-fail b{color:var(--fail)}.i-warn b{color:var(--warn)}
-.i-ok b{color:var(--ok)}.i-info b{color:var(--muted)}.h-fail{border-color:var(--fail)}.h-warn{border-color:var(--warn)}
-.empty,.hint{color:var(--muted);margin:4px 0}details{margin-top:10px}summary{cursor:pointer}
-@media (max-width:640px){body{padding:16px}.controls{width:100%}.controls input{flex:1}}
+:root{--paper:#f3f5f8;--surface:#fff;--ink:#161a21;--ink2:#4b5563;--muted:#6b7380;--rule:#e3e7ec;--rule2:#eef1f4;
+--pos:#2a78d6;--neg:#e34948;--ex:#b8bfc9;--good:#0e8a0e;--warn:#a86a00;--fail:#c8322f;--focus:#2a78d6;
+--goodbg:#e6f4e6;--warnbg:#fbf1dc;--failbg:#fbe7e6;--chip:#eef1f4}
+@media (prefers-color-scheme:dark){:root{--paper:#141920;--surface:#1b212b;--ink:#e9edf2;--ink2:#b4bcc8;--muted:#8a93a1;
+--rule:#2a313d;--rule2:#232a35;--pos:#3987e5;--neg:#e66767;--ex:#4a5260;--good:#4cc76a;--warn:#e7b04a;--fail:#ff7a6b;
+--focus:#3987e5;--goodbg:#173022;--warnbg:#2f2614;--failbg:#351b1c;--chip:#262d39}}
+*{box-sizing:border-box}
+html{background:var(--paper)}
+body{margin:0;color:var(--ink);font:15px/1.5 "IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+ font-variant-numeric:tabular-nums}
+button{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:4px}
+.visually-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+.top,.bar,main{max-width:1320px;margin:0 auto;padding-left:24px;padding-right:24px}
+.top{display:flex;align-items:center;justify-content:space-between;gap:16px;padding-top:22px;padding-bottom:6px}
+.brand h1{margin:0;font:600 22px/1.2 "IBM Plex Sans Condensed","IBM Plex Sans",sans-serif;letter-spacing:-.01em}
+.brand p{margin:2px 0 0;color:var(--muted);font-size:13px}
+.health-pill{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--rule);background:var(--surface);
+ border-radius:999px;padding:6px 14px 6px 8px;cursor:pointer;font-size:14px;font-weight:500}
+.health-pill .ic{display:inline-grid;place-items:center;width:20px;height:20px;border-radius:50%;font-size:12px;font-weight:700}
+.hp-ok .ic{background:var(--goodbg);color:var(--good)}.hp-warn .ic{background:var(--warnbg);color:var(--warn)}
+.hp-fail .ic{background:var(--failbg);color:var(--fail)}.hp-fail{border-color:var(--fail)}
+.bar{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:12px;border-bottom:1px solid var(--rule);
+ position:sticky;top:0;background:var(--paper);z-index:5;padding-top:10px}
+[role=tablist]{display:flex;gap:4px;overflow-x:auto}
+[role=tab]{background:none;border:0;border-bottom:2px solid transparent;padding:10px 12px 11px;cursor:pointer;
+ color:var(--ink2);font-weight:500;white-space:nowrap}
+[role=tab][aria-selected=true]{color:var(--ink);border-bottom-color:var(--ink)}
+.count{display:inline-block;min-width:22px;padding:0 6px;margin-left:4px;border-radius:999px;background:var(--chip);
+ font-size:12px;text-align:center;color:var(--ink2)}
+.filters{display:flex;gap:8px;padding-bottom:8px}
+input,select{font:inherit;font-size:14px;padding:7px 11px;border:1px solid var(--rule);border-radius:8px;background:var(--surface);color:var(--ink)}
+input{width:240px}
+main{padding-top:20px;padding-bottom:60px}
+.lead{font-size:17px;margin:0 0 22px;max-width:72ch}
+section{margin-bottom:34px}
+.sechead{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 16px;margin-bottom:10px}
+.sechead h2{margin:0;font:600 18px/1.3 "IBM Plex Sans Condensed","IBM Plex Sans",sans-serif}
+.sechead p{margin:0;color:var(--muted);font-size:14px;max-width:80ch}
+.tablewrap{background:var(--surface);border:1px solid var(--rule);border-radius:10px;overflow-x:auto}
+table{border-collapse:collapse;width:100%}
+th{text-align:left;font:500 13px/1.3 "IBM Plex Sans Condensed","IBM Plex Sans",sans-serif;color:var(--muted);
+ padding:10px 14px;border-bottom:1px solid var(--rule);white-space:nowrap;vertical-align:bottom}
+th .sort{background:none;border:0;padding:0;cursor:pointer;color:inherit;font:inherit}
+th .sort[data-dir]::after{content:" \\25BE"}th .sort[data-dir=asc]::after{content:" \\25B4"}
+td{padding:11px 14px;border-bottom:1px solid var(--rule2);vertical-align:middle}
+tbody tr:last-child td{border-bottom:0}
+tbody tr[data-pair]{cursor:pointer}tbody tr[data-pair]:hover{background:var(--rule2)}
+.n{text-align:right}th.n{text-align:right}
+.sub{display:block;color:var(--muted);font-size:12.5px;font-weight:400}
+.open{background:none;border:0;padding:0;cursor:pointer;font:600 16px/1.2 "IBM Plex Sans Condensed","IBM Plex Sans",sans-serif}
+.trade{display:grid;grid-template-columns:auto auto 1fr;gap:2px 8px;align-items:center;font-size:14px;white-space:nowrap}
+.side{color:var(--muted);font-size:12.5px}
+.vb{text-decoration:none;font:600 11px/1 "IBM Plex Sans Condensed",sans-serif;padding:3px 5px;border-radius:4px;
+ background:var(--chip);color:var(--ink2);text-align:center;min-width:30px}
+.vb-var{background:var(--ink);color:var(--surface)}
+.c-apy{white-space:nowrap}.c-apy b{font-size:16px;font-weight:600}
+.t-up{color:var(--pos)}.t-down{color:var(--neg)}.t-flat,.muted{color:var(--muted)}
+.c-trend{white-space:nowrap}
+.spark{width:144px;height:24px;display:block}
+.spark line{stroke:var(--rule);stroke-width:1}.sk-zero{stroke:var(--muted)!important;stroke-opacity:.5}
+.sk-pos{fill:var(--pos)}.sk-neg{fill:var(--neg)}.sk-ex{fill:var(--ex)}.sk-miss{fill:var(--ex)}
+.chip{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12.5px;font-weight:500;background:var(--chip);color:var(--ink2)}
+.s-qualified{background:var(--goodbg);color:var(--good)}.s-suspended{background:var(--warnbg);color:var(--warn)}
+.s-terminated{background:var(--failbg);color:var(--fail)}
+.why{display:block;color:var(--ink2);font-size:13px;margin-top:3px;min-width:220px}
+.empty{background:var(--surface);border:1px dashed var(--rule);border-radius:10px;padding:18px;color:var(--muted);margin:0}
+.fine{color:var(--muted);font-size:13px;max-width:90ch}
+.issues{list-style:none;margin:0 0 22px;padding:0;background:var(--surface);border:1px solid var(--rule);border-radius:10px}
+.issues li{padding:12px 16px;border-bottom:1px solid var(--rule2);display:flex;gap:10px;align-items:baseline}
+.issues li:last-child{border-bottom:0}
+.issues .ic{display:inline-grid;place-items:center;width:20px;height:20px;border-radius:50%;font-size:12px;font-weight:700;flex:none}
+.i-ok .ic{background:var(--goodbg);color:var(--good)}.i-warn .ic{background:var(--warnbg);color:var(--warn)}
+.i-fail .ic{background:var(--failbg);color:var(--fail)}.i-info .ic{background:var(--chip);color:var(--ink2)}
+.groups{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
+.group{background:var(--surface);border:1px solid var(--rule);border-radius:10px;padding:14px 16px}
+.group h3{margin:0 0 8px;font:600 15px/1.3 "IBM Plex Sans Condensed","IBM Plex Sans",sans-serif}
+.group dl{display:grid;grid-template-columns:1fr auto;gap:6px 12px;margin:0;font-size:14px}
+.group dt{color:var(--ink2)}.group dd{margin:0;text-align:right;font-weight:500}
+.note{color:var(--muted);font-size:13px;margin:0 0 8px}
+.misses{margin-top:16px;background:var(--surface);border:1px solid var(--rule);border-radius:10px;padding:12px 16px}
+.misses summary{cursor:pointer;font-weight:500}
+.events td.when{white-space:nowrap;color:var(--ink2)}
+.scrim{position:fixed;inset:0;background:rgba(20,25,32,.35);z-index:20}
+.drawer{position:fixed;top:0;right:0;height:100%;width:min(680px,100%);background:var(--surface);z-index:21;
+ box-shadow:-12px 0 32px rgba(20,25,32,.18);transform:translateX(102%);transition:transform .2s ease;overflow-y:auto}
+.drawer.is-open{transform:none}
+.drawer .close{position:absolute;top:14px;right:14px;width:36px;height:36px;border:1px solid var(--rule);border-radius:50%;
+ background:var(--surface);cursor:pointer}
+.drawer-body{padding:24px 26px 40px}
+.d-head h2{margin:0 0 4px;font:600 26px/1.1 "IBM Plex Sans Condensed","IBM Plex Sans",sans-serif}
+.d-head .trade{font-size:15px;margin:10px 0 4px}
+.d-figs{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--rule);border:1px solid var(--rule);
+ border-radius:10px;overflow:hidden;margin:18px 0}
+.d-figs div{background:var(--surface);padding:10px 12px}.d-figs span{display:block;color:var(--muted);font-size:12.5px}
+.d-figs b{font-size:17px;font-weight:600}
+.d-sec{margin-top:24px}.d-sec p{margin:0;color:var(--ink2);font-size:14px}.d-sec h3{margin:0 0 8px;font:600 15px/1.3 "IBM Plex Sans Condensed","IBM Plex Sans",sans-serif}
+.chart{position:relative}.chart svg{width:100%;height:auto;display:block}
+.chart .axis{fill:var(--muted);font:11px "IBM Plex Sans",sans-serif}
+.chart .zero{stroke:var(--muted);stroke-opacity:.6}.chart .grid{stroke:var(--rule2)}
+.chart .min{stroke:var(--ink2);stroke-dasharray:4 4;stroke-opacity:.7}
+.chart .pos{fill:var(--pos)}.chart .neg{fill:var(--neg)}.chart .ex{fill:var(--ex)}.chart .miss{fill:var(--ex);opacity:.6}
+.chart .run{stroke:var(--ink);stroke-width:1.5}.chart .kill{fill:var(--fail)}
+.chart .cross{stroke:var(--ink2);stroke-width:1}
+.legend{display:flex;flex-wrap:wrap;gap:4px 16px;font-size:12.5px;color:var(--ink2);margin-top:8px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+.tip{position:absolute;pointer-events:none;background:var(--ink);color:var(--surface);font-size:12.5px;padding:8px 10px;
+ border-radius:8px;white-space:nowrap;transform:translate(-50%,-100%);margin-top:-8px;z-index:2}
+.kv{display:grid;grid-template-columns:1fr auto auto;gap:6px 16px;font-size:14px}
+.kv .h{color:var(--muted);font-size:12.5px}.kv .r{text-align:right}
+.flags{list-style:none;margin:0;padding:0}.flags li{padding:8px 0;border-bottom:1px solid var(--rule2);font-size:14px}
+.flags code{font:500 12px "IBM Plex Sans Condensed",sans-serif;color:var(--muted);display:block}
+details.tbl summary{cursor:pointer;color:var(--ink2);font-size:13px;margin-top:8px}
+details.tbl table{font-size:13px}details.tbl td,details.tbl th{padding:5px 8px}
+@media (max-width:820px){.top,.bar,main{padding-left:16px;padding-right:16px}.filters{width:100%}input{flex:1;width:auto}
+ .c-trend,.c-net,.c-age,.c-spark{display:none}.d-figs{grid-template-columns:repeat(2,1fr)}.drawer-body{padding:20px 16px 40px}}
+@media (prefers-reduced-motion:reduce){.drawer{transition:none}}
 </style></head><body>{{BODY}}
 <script>
-document.querySelectorAll('time[data-ts]').forEach(function(t){var d=new Date(+t.dataset.ts*1000);
- t.title=t.textContent;t.textContent=d.toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});});
-var q=document.getElementById('q'),cls=document.getElementById('cls');
-try{q.value=sessionStorage.getItem('q')||'';cls.value=sessionStorage.getItem('cls')||'';}catch(e){}
-function apply(){var t=q.value.toLowerCase(),c=cls.value;try{sessionStorage.setItem('q',q.value);sessionStorage.setItem('cls',c);}catch(e){}
- document.querySelectorAll('tr[data-class]').forEach(function(r){r.style.display=((!c||r.dataset.class===c)&&r.dataset.text.indexOf(t)>=0)?'':'none';});}
+(function(){
+var $=function(s,el){return (el||document).querySelector(s)},$$=function(s,el){return [].slice.call((el||document).querySelectorAll(s))};
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function local(ts,opt){return new Date(ts*1000).toLocaleString([],opt||{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}
+$$('time[data-ts]').forEach(function(t){t.title=t.textContent;t.textContent=local(+t.dataset.ts)});
+function store(k,v){try{if(v===undefined)return sessionStorage.getItem(k);sessionStorage.setItem(k,v)}catch(e){return null}}
+// tabs
+function show(id){if(!$('#tab-'+id))id='opportunities';$$('[role=tab]').forEach(function(t){t.setAttribute('aria-selected',t.dataset.tab===id)});
+ $$('[role=tabpanel]').forEach(function(p){p.hidden=p.id!=='tab-'+id});if(location.hash!=='#'+id)history.replaceState(null,'','#'+id)}
+$$('[role=tab]').forEach(function(t){t.onclick=function(){show(t.dataset.tab)}});
+$$('[data-goto]').forEach(function(b){b.onclick=function(){show(b.dataset.goto)}});
+$('[role=tablist]').addEventListener('keydown',function(e){var tabs=$$('[role=tab]'),i=tabs.indexOf(document.activeElement);
+ if(i<0)return;if(e.key==='ArrowRight'||e.key==='ArrowLeft'){var j=(i+(e.key==='ArrowRight'?1:-1)+tabs.length)%tabs.length;tabs[j].focus();show(tabs[j].dataset.tab);e.preventDefault()}});
+show(location.hash.slice(1));window.addEventListener('hashchange',function(){show(location.hash.slice(1))});
+// filters
+var q=$('#q'),cls=$('#cls');q.value=store('q')||'';cls.value=store('cls')||'';
+function apply(){var t=q.value.toLowerCase().trim(),c=cls.value;store('q',q.value);store('cls',c);
+ $$('tbody tr[data-class]').forEach(function(r){r.hidden=!((!c||r.dataset.class===c)&&r.dataset.text.indexOf(t)>=0)})}
 q.oninput=apply;cls.onchange=apply;apply();
-document.querySelectorAll('table.sortable').forEach(function(tb){tb.querySelectorAll('th').forEach(function(th,i){
- th.onclick=function(){var rows=[].slice.call(tb.querySelectorAll('tr')).slice(1),dir=th.dataset.dir==='asc'?-1:1;th.dataset.dir=dir>0?'asc':'desc';
-  rows.sort(function(a,b){var x=a.children[i].dataset.v,y=b.children[i].dataset.v;var nx=parseFloat(x),ny=parseFloat(y);
-   if(!isNaN(nx)&&!isNaN(ny))return (nx-ny)*dir;return String(x||'').localeCompare(String(y||''))*dir;});
-  rows.forEach(function(r){tb.appendChild(r);});};});});
-setTimeout(function(){location.reload();},300000);
-</script></body></html>"""
+// sorting
+$$('th .sort').forEach(function(b){b.onclick=function(e){e.stopPropagation();var tb=b.closest('table'),i=+b.dataset.col,
+ dir=b.dataset.dir==='desc'?'asc':'desc';$$('th .sort',tb).forEach(function(x){delete x.dataset.dir});b.dataset.dir=dir;
+ var body=tb.tBodies[0],rows=[].slice.call(body.rows),k=dir==='asc'?1:-1;
+ rows.sort(function(a,c){var x=a.cells[i].dataset.v,y=c.cells[i].dataset.v,nx=parseFloat(x),ny=parseFloat(y);
+  if(!isNaN(nx)&&!isNaN(ny))return (nx-ny)*k;return String(x||'').localeCompare(String(y||''))*k});
+ rows.forEach(function(r){body.appendChild(r)})}});
+// drawer
+var drawer=$('.drawer'),scrim=$('.scrim'),dbody=$('.drawer-body'),lastFocus=null;
+function closeDrawer(){drawer.classList.remove('is-open');drawer.setAttribute('aria-hidden','true');scrim.hidden=true;if(lastFocus)lastFocus.focus()}
+$('.close',drawer).onclick=closeDrawer;scrim.onclick=closeDrawer;
+document.addEventListener('keydown',function(e){if(e.key==='Escape'&&drawer.classList.contains('is-open'))closeDrawer()});
+document.addEventListener('click',function(e){var el=e.target.closest('[data-pair]');if(!el||e.target.closest('th'))return;
+ lastFocus=e.target.closest('button')||el;openPair(el.dataset.pair)});
+function openPair(id){dbody.innerHTML='<p class="muted">Loading...</p>';drawer.classList.add('is-open');drawer.setAttribute('aria-hidden','false');
+ scrim.hidden=false;drawer.focus();fetch('/api/pair?id='+encodeURIComponent(id)).then(function(r){return r.json()}).then(render)
+ .catch(function(){dbody.innerHTML='<p>Could not load this pair. Refresh the page and try again.</p>'})}
+var STATUSCLS={QUALIFIED:'s-qualified',SUSPENDED:'s-suspended',TERMINATED:'s-terminated'};
+function pct(x,d){return x==null?'n/a':(x*100).toFixed(d==null?1:d)+'%'}
+function usd(x){return x==null?'n/a':(x<0?'-':'')+'$'+Math.abs(x).toFixed(2)}
+function hrs(h){return h==null?'never':(h<1000?Math.round(h)+'h':'>999h')}
+function legHtml(side,l){return '<span class="side">'+side+'</span><abbr class="vb vb-'+l.badge.toLowerCase()+'" title="'+esc(l.name)+'">'+esc(l.badge)+'</abbr><span class="sym">'+esc(l.symbol)+'</span>'}
+function render(d){if(d.error){dbody.innerHTML='<p>'+esc(d.error)+'</p>';return}var m=d.metrics||{},c=(m.costs||{})['__SZ__']||{};
+ var trend={UP:'Rising',DOWN:'Falling',STABLE:'Stable'}[m.trend]||'Not enough data';
+ var h='<div class="d-head"><h2>'+esc(d.asset)+'</h2><span class="chip '+(STATUSCLS[d.status]||'')+'">'+esc(d.status_label)+'</span> '
+  +'<span class="muted">'+(d.class==='tradfi'?'RWA':'Crypto')+(d.cohort?', '+esc(d.cohort.toLowerCase())+' run of '+Math.round(d.age_h)+'h':'')+'</span>'
+  +'<div class="trade">'+legHtml('Long',d.long)+legHtml('Short',d.short)+'</div></div>';
+ h+='<div class="d-figs"><div><span>APY at 1x</span><b>'+pct(d.apy_1x)+'</b></div><div><span>At '+(d.max_lev||1)+'x leverage</span><b>'+pct(d.apy_max)+'</b></div>'
+  +'<div><span>Trend</span><b>'+trend+(m.trend_delta_apy!=null?' <small class="muted">'+(m.trend_delta_apy>=0?'+':'')+(m.trend_delta_apy*100).toFixed(1)+' pts</small>':'')+'</b></div>'
+  +'<div><span>Last 24h, APY at 1x</span><b>'+pct(m.apy_now_1x)+'</b></div><div><span>Conservative (48h/7d)</span><b>'+pct(m.conservative_hourly==null?null:m.conservative_hourly*d.apy_factor)+'</b></div>'
+  +'<div><span>Profitable hours, 48h</span><b>'+pct(m.pos_share_48h,0)+'</b></div></div>';
+ h+='<div class="d-sec"><h3>Hourly net funding, last 7 days</h3><div class="chart" id="chart"></div>'
+  +'<div class="legend"><span><i style="background:var(--pos)"></i>Earning</span><span><i style="background:var(--neg)"></i>Paying</span>'
+  +'<span><i style="background:var(--ex)"></i>Left out (dividend window or outlier)</span><span><i style="background:var(--ink);width:2px"></i>Current run started</span>'
+  +'<span><i style="background:var(--fail);border-radius:50%"></i>Run killed</span><span>Dashed line: '+pct(d.min_apy,0)+' minimum</span></div>'+tableView(d)+'</div>';
+ h+='<div class="d-sec"><h3>Costs to enter and exit</h3>'+costs(m)+'</div>';
+ h+='<div class="d-sec"><h3>Leverage</h3><p>'+esc(d.leverage_note)+'</p></div>';
+ if(d.reasons.length&&d.status!=='QUALIFIED'&&d.status!=='EMERGING')h+='<div class="d-sec"><h3>Why it isn\\'t qualified</h3><ul class="flags">'+d.reasons.map(function(r){return '<li>'+esc(r)+'</li>'}).join('')+'</ul></div>';
+ if(d.flags.length)h+='<div class="d-sec"><h3>Things to know</h3><ul class="flags">'+d.flags.map(function(f){return '<li>'+esc(f.text)+'<code>'+esc(f.code)+'</code></li>'}).join('')+'</ul></div>';
+ h+='<p class="fine" style="margin-top:24px">Each hour pairs the Hyperliquid or Lighter hourly rate with the last recorded Variational settlement, held until the next one. '
+  +'A run is killed after '+d.terminate_after+' unprofitable hours in a row. Updated '+local(d.updated_at)+'.</p>';
+ dbody.innerHTML=h;drawChart($('#chart'),d)}
+function costs(m){var rows='';['1000','5000'].forEach(function(s){var c=(m.costs||{})[s]||{};if(c.status!=='OK'){rows+='<span>$'+(+s).toLocaleString()+' per leg</span><span class="r muted">'+(c.status==='NO_DEPTH'?'book too thin':'not fetched yet')+'</span><span></span>';return}
+ rows+='<span>$'+(+s).toLocaleString()+' per leg</span><span class="r">'+usd(c.cost_usd_maker)+' maker, '+hrs(c.payback_h_maker)+'</span><span class="r">'+usd(c.cost_usd)+' taker, '+hrs(c.payback_h)+'</span>'});
+ var c1=(m.costs||{})['1000']||{};
+ return '<div class="kv"><span class="h">Size</span><span class="h r">Maker cost, payback</span><span class="h r">Taker cost, payback</span>'+rows+'</div>'
+ +'<p class="note" style="margin-top:8px">Payback uses the current 24h rate. '+(c1.status==='OK'?'Entry basis '+(c1.basis_bps>=0?'+':'')+c1.basis_bps.toFixed(1)+' bp; expected net over 7 days '+usd(c1.net_hold_usd)+' per $1,000 leg after taker costs.':'')+'</p>'}
+function tableView(d){var rows=d.series.slice(-24).reverse().map(function(p){return '<tr><td>'+local(p.t)+'</td><td class="n">'+(p.net==null?'missing':pct(p.net*d.apy_factor))+(p.ex?' ('+p.ex+')':'')+'</td><td class="n">'+(p.l==null?'-':(p.l*1e4).toFixed(3)+' bp')+'</td><td class="n">'+(p.s==null?'-':(p.s*1e4).toFixed(3)+' bp')+'</td></tr>'}).join('');
+ return '<details class="tbl"><summary>Show the last 24 hours as a table</summary><div class="tablewrap"><table><thead><tr><th>Hour</th><th class="n">Net, APY at 1x</th><th class="n">Long leg per hour</th><th class="n">Short leg per hour</th></tr></thead><tbody>'+rows+'</tbody></table></div></details>'}
+function drawChart(el,d){var s=d.series;if(!s.length){el.innerHTML='<p class="muted">No comparable hours yet.</p>';return}
+ var W=640,H=230,L=44,R=8,T=12,B=26,n=s.length,bw=(W-L-R)/n,f=d.apy_factor;
+ var ok=s.filter(function(p){return p.net!=null&&!p.ex}).map(function(p){return p.net*f});
+ function q98(a){a=a.slice().sort(function(x,y){return x-y});return a.length?a[Math.floor(.98*(a.length-1))]:0}
+ var up=Math.max(q98(ok.filter(function(v){return v>0}))*1.15,d.min_apy*2,.05);
+ var dn=Math.max(q98(ok.filter(function(v){return v<0}).map(function(v){return -v}))*1.15,up*.12);
+ var y=function(v){v=Math.max(-dn,Math.min(up,v));return T+(H-T-B)*(up-v)/(up+dn)},z=y(0),top=Math.max(up,dn);
+ var step=top>2?1:top>1?.5:top>.4?.2:top>.2?.1:.05,g='';
+ for(var v=-Math.floor(dn/step)*step;v<=up+1e-9;v+=step){var yy=y(v);g+='<line class="grid" x1="'+L+'" x2="'+(W-R)+'" y1="'+yy+'" y2="'+yy+'"/><text class="axis" x="'+(L-6)+'" y="'+(yy+4)+'" text-anchor="end">'+Math.round(v*100)+'%</text>'}
+ var bars='';s.forEach(function(p,i){var x=L+i*bw+.5,w=Math.max(1,bw-1);if(p.net==null){bars+='<rect class="miss" x="'+x+'" y="'+(z-1)+'" width="'+w+'" height="2"/>';return}
+  var v=p.net*f,yv=y(v),cls=p.ex?'ex':(v>0?'pos':'neg');bars+='<rect class="'+cls+'" x="'+x+'" y="'+Math.min(yv,z)+'" width="'+w+'" height="'+Math.max(1,Math.abs(z-yv))+'"/>'});
+ var marks='',idx=function(t){for(var i=0;i<n;i++)if(s[i].t>t)return i;return n};
+ if(d.run_start){var ri=idx(d.run_start);if(ri<n){var rx=L+ri*bw;marks+='<line class="run" x1="'+rx+'" x2="'+rx+'" y1="'+T+'" y2="'+(H-B)+'"/>'}}
+ (d.kills||[]).forEach(function(k){var ki=idx(k-1);if(ki<n)marks+='<circle class="kill" cx="'+(L+ki*bw+bw/2)+'" cy="'+(H-B-6)+'" r="4"/>'});
+ var ticks='';for(var i=0;i<n;i++){var t=new Date(s[i].t*1000);if(t.getHours()===0){ticks+='<text class="axis" x="'+(L+i*bw)+'" y="'+(H-8)+'">'+t.toLocaleDateString([],{weekday:'short'})+'</text>'}}
+ var my=y(d.min_apy);el.innerHTML='<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Hourly net funding for the last '+n+' hours, as APY at 1x">'+g
+  +'<line class="min" x1="'+L+'" x2="'+(W-R)+'" y1="'+my+'" y2="'+my+'"/>'+bars+'<line class="zero" x1="'+L+'" x2="'+(W-R)+'" y1="'+z+'" y2="'+z+'"/>'+marks+ticks
+  +'<line class="cross" x1="0" x2="0" y1="'+T+'" y2="'+(H-B)+'" visibility="hidden"/><rect x="'+L+'" y="0" width="'+(W-L-R)+'" height="'+H+'" fill="transparent" class="hit"/></svg><div class="tip" hidden></div>';
+ var svg=$('svg',el),tip=$('.tip',el),cross=$('.cross',el);
+ function move(e){var r=svg.getBoundingClientRect(),sx=(e.clientX-r.left)*W/r.width,i=Math.floor((sx-L)/bw);if(i<0||i>=n){leave();return}
+  var p=s[i],cx=L+i*bw+bw/2;cross.setAttribute('x1',cx);cross.setAttribute('x2',cx);cross.setAttribute('visibility','visible');
+  tip.innerHTML='<b>'+local(p.t)+'</b><br>'+(p.net==null?'No data for this hour':'Net '+pct(p.net*f)+' APY at 1x'+(p.ex?' (left out: '+p.ex+')':''))
+   +(p.l!=null?'<br>Long leg '+(p.l*1e4).toFixed(3)+' bp/h':'')+(p.s!=null?'<br>Short leg '+(p.s*1e4).toFixed(3)+' bp/h':'');
+  tip.hidden=false;tip.style.left=(cx*r.width/W)+'px';tip.style.top=(Math.min(y(p.net==null?0:p.net*f),z)*r.height/H)+'px'}
+ function leave(){tip.hidden=true;cross.setAttribute('visibility','hidden')}
+ svg.addEventListener('mousemove',move);svg.addEventListener('mouseleave',leave)}
+// refresh every 5 minutes unless the detail panel is open or the filter has focus
+setInterval(function(){if(!drawer.classList.contains('is-open')&&document.activeElement!==q)location.reload()},300000);
+})();
+</script></body></html>""".replace("__SZ__", SZ)
 
 
 # ---------------- server ----------------
 
 class _Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path.split("?")[0] not in ("/", "/index.html"):
-            self.send_error(404)
-            return
-        try:
-            body, code = build_page(self.server.conn, db_path=self.server.db_path).encode(), 200
-        except Exception as e:  # show the error instead of a blank page; the worker keeps running
-            body, code = f"<pre>dashboard error: {html.escape(repr(e))}</pre>".encode(), 500
+    def _send(self, code, body, ctype):
         self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_GET(self):
+        url = urlparse(self.path)
+        try:
+            if url.path in ("/", "/index.html"):
+                self._send(200, build_page(self.server.conn, db_path=self.server.db_path).encode(),
+                           "text/html; charset=utf-8")
+            elif url.path == "/api/pair":
+                pid = (parse_qs(url.query).get("id") or [""])[0]
+                d = pair_detail(self.server.conn, pid)
+                body = json.dumps(d if d is not None else {"error": "This pair is no longer tracked."})
+                self._send(200 if d is not None else 404, body.encode(), "application/json")
+            else:
+                self.send_error(404)
+        except Exception as e:  # show the error instead of a blank page; the worker keeps running
+            self._send(500, f"<pre>dashboard error: {html.escape(repr(e))}</pre>".encode(), "text/html; charset=utf-8")
 
     def log_message(self, *args):
         pass

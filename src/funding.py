@@ -3,7 +3,7 @@ positive = longs pay shorts. ts = UTC settlement time in seconds. Gaps are never
 import json
 import time
 
-from src.config import (RUNS_KEEP_DAYS, VAR_LATE_WINDOW_S, VAR_PRE_CAPTURE_S, VAR_RATE_SOURCE, VAR_SNAPSHOT_KEEP_DAYS,
+from src.config import (EVENTS_KEEP_DAYS, RUNS_KEEP_DAYS, VAR_LATE_WINDOW_S, VAR_PRE_CAPTURE_S, VAR_RATE_SOURCE, VAR_SNAPSHOT_KEEP_DAYS,
                         VAR_WINDOW_S)
 from src.venues import hyperliquid as hl, lighter as lt, variational as va
 
@@ -239,13 +239,14 @@ def derive_variational(conn, now=None, mode=None, window=None, lookback_s=3 * 86
 
 
 def housekeeping(conn, now=None):
-    """Prune Variational snapshots and run logs beyond their retention (settlements are kept forever)."""
+    """Prune Variational snapshots, run logs and signal events beyond their retention (settlements are kept forever)."""
     now = int(now or time.time())
     with conn:
         snaps = conn.execute("DELETE FROM var_snapshots WHERE captured_at < ?",
                              (now - int(VAR_SNAPSHOT_KEEP_DAYS * 86400),)).rowcount
         runs = conn.execute("DELETE FROM runs WHERE started_at < ?", (now - int(RUNS_KEEP_DAYS * 86400),)).rowcount
-    return {"snapshots_pruned": snaps, "runs_pruned": runs}
+        events = conn.execute("DELETE FROM signal_events WHERE ts < ?", (now - int(EVENTS_KEEP_DAYS * 86400),)).rowcount
+    return {"snapshots_pruned": snaps, "runs_pruned": runs, "events_pruned": events}
 
 
 # ---------------- Data quality ----------------
