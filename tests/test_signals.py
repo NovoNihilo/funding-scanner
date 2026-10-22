@@ -26,20 +26,28 @@ def _p(nets):
             for k, n in enumerate(nets)]
 
 
-def test_mixed_interval_no_double_count():
-    var_short = {8 * H: (8e-5, 8 * H, "ESTIMATED")}
-    hl_long = _hourly(H, 8, 1e-6)
+def test_variational_held_forward_hourly_without_double_counting():
+    var_short = {8 * H: (8e-5, 8 * H, "ESTIMATED")}  # 8h settlement -> 1e-5 per hour
+    hl_long = _hourly(H, 16, 1e-6)
     ps = build_periods(hl_long, var_short, "short")
-    assert len(ps) == 1 and ps[0]["hours"] == 8.0
-    assert abs(ps[0]["net"] - (8e-5 - 8e-6)) < 1e-15
-    assert ps[0]["quality"] == "ESTIMATED"
+    assert [p["end"] for p in ps] == [k * H for k in range(8, 17)]  # starts at the first known settlement
+    assert all(abs(p["net"] - (1e-5 - 1e-6)) < 1e-15 and p["hours"] == 1.0 for p in ps)
+    assert abs(sum(p["net"] for p in ps[1:]) - (8e-5 - 8e-6)) < 1e-15  # one interval's worth over 8 hours
 
 
-def test_missing_fine_hour_makes_period_incomplete():
+def test_variational_hold_expires_and_missing_hour_stays_missing():
     var_short = {8 * H: (8e-5, 8 * H, "ESTIMATED")}
-    hl_long = _hourly(H, 8, 1e-6)
-    del hl_long[4 * H]
-    assert build_periods(hl_long, var_short, "short")[0]["net"] is None
+    hl_long = _hourly(H, 30, 1e-6)
+    del hl_long[10 * H]
+    ps = {p["end"]: p["net"] for p in build_periods(hl_long, var_short, "short")}
+    assert ps[10 * H] is None and ps[17 * H] is not None  # missing HL hour; held up to interval + 1h
+    assert ps[18 * H] is None and ps[30 * H] is None       # next settlement never recorded -> not extended
+
+
+def test_dividend_window_hours_excluded():
+    var_long = {8 * H: (1e-5, 8 * H, "ESTIMATED"), 10 * H: (1e-5, 2 * H, "ESTIMATED")}  # shortened interval
+    ps = {p["end"]: p for p in build_periods(var_long, _hourly(H, 12, 5e-6), "long", normal_interval=8 * H)}
+    assert not ps[9 * H]["excluded"] and ps[10 * H]["excluded"] and ps[11 * H]["excluded"]
 
 
 def test_hourly_grid_gap_is_not_zero_filled():
@@ -76,7 +84,8 @@ def test_apy_capital_basis_and_leverage_range():
 
 
 def test_cohorts():
-    assert [cohort_for(h) for h in (5, 30, 100, 200)] == ["FRESH", "ACTIONABLE", "ESTABLISHED", "DURABLE"]
+    assert [cohort_for(h) for h in (5, 12, 30, 100, 200)] == ["FRESH", "EMERGING", "ACTIONABLE", "ESTABLISHED",
+                                                              "DURABLE"]
 
 
 def _seed(conn, now, short_rate, long_rate, hours=60, rt_cost=0.0002, p99=0.04, rt_maker=0.0001):
@@ -197,3 +206,64 @@ def test_required_venue_drops_pairs_without_it(monkeypatch):
     ids = {r[0] for r in conn.execute("SELECT pair_id FROM signals")}
     assert res["removed"] == 2 and res["pairs"] == 4  # hyperliquid<>lighter gone, both legs vs variational kept
     assert all("variational:" in pid for pid in ids)
+
+
+def _var_pair(conn, now, var_rates, hl_rates):
+    """Variational short (4h settlements) vs Hyperliquid long (hourly). var_rates: {ts: rate per 4h}."""
+    for v, sym, ivl in (("hyperliquid", "AAA", 3600), ("variational", "AAA-PERP", 14400)):
+        conn.execute("INSERT INTO markets (venue, symbol, asset, market_id, interval_s, asset_class, flags, matched,"
+                     " active, updated_at, max_leverage) VALUES (?,?,'AAA',?,?,'crypto','',1,1,0,20)", (v, sym, sym, ivl))
+    for t, r in var_rates.items():
+        conn.execute("INSERT INTO settlements VALUES ('variational','AAA-PERP',?,14400,?,NULL,'ESTIMATED','t',NULL,0)",
+                     (t, r))
+    for t, r in hl_rates.items():
+        conn.execute("INSERT INTO settlements VALUES ('hyperliquid','AAA',?,3600,?,0,'CONFIRMED','t',NULL,0)", (t, r))
+
+
+VPAIR = "AAA|hyperliquid:AAA>variational:AAA-PERP"
+
+
+def test_three_unprofitable_hours_kill_a_run_inside_one_variational_interval(monkeypatch):
+    monkeypatch.setattr(signals, "REQUIRED_VENUE", "variational")
+    conn = connect(":memory:")
+    now = 1000 * H
+    var = {now - k * 4 * H: 1.2e-4 for k in range(0, 15)}           # short Var receives 3e-5 per hour
+    hl = {now - k * H: 0.0 for k in range(60)}
+    for k in (1, 2, 3):                                               # 3 hours where the HL long costs more
+        hl[now - k * H] = 5e-5
+    _var_pair(conn, now, var, hl)
+    evaluate_all(conn, now - 4 * H)
+    assert conn.execute("SELECT status FROM signals WHERE pair_id=?", (VPAIR,)).fetchone()[0] == "QUALIFIED"
+    evaluate_all(conn, now - H)                                       # hours -3, -2, -1 were all negative
+    row = conn.execute("SELECT status, run_start FROM signals WHERE pair_id=?", (VPAIR,)).fetchone()
+    assert row["status"] == "TERMINATED" and row["run_start"] is None
+    evaluate_all(conn, now)                                           # next positive hour starts a NEW run
+    row = conn.execute("SELECT status, cohort, age_h FROM signals WHERE pair_id=?", (VPAIR,)).fetchone()
+    assert (row["status"], row["cohort"], row["age_h"]) == ("MONITORING", "FRESH", 1.0)
+
+
+def test_emerging_between_8_and_24_hours(monkeypatch):
+    monkeypatch.setattr(signals, "REQUIRED_VENUE", "variational")
+    conn = connect(":memory:")
+    now = 1000 * H
+    var = {now - k * 4 * H: 1.2e-4 for k in range(0, 4)}             # 12h of Variational history
+    hl = {now - k * H: 0.0 for k in range(40)}
+    _var_pair(conn, now, var, hl)
+    evaluate_all(conn, now)
+    row = conn.execute("SELECT status, cohort, apy_1x, flags FROM signals WHERE pair_id=?", (VPAIR,)).fetchone()
+    assert row["status"] == "EMERGING" and row["cohort"] == "EMERGING" and "EARLY_APY" in row["flags"]
+    assert abs(row["apy_1x"] - 3e-5 * 8760 / 2) < 1e-9
+
+
+def test_payback_uses_current_rate_and_trend_detects_rise():
+    conn = connect(":memory:")
+    now = 1000 * H
+    _seed(conn, now, short_rate=1e-5, long_rate=0.0, hours=100, rt_cost=0.0002, rt_maker=0.0001)
+    for k in range(12):                                               # last 12h: rate triples
+        conn.execute("UPDATE settlements SET rate=3e-5 WHERE venue='lighter' AND ts=?", (now - k * H,))
+    evaluate_all(conn, now)
+    m = json.loads(_row(conn, "metrics")["metrics"])
+    current = (12 * 3e-5 + 12 * 1e-5) / 24
+    assert abs(m["current_hourly"] - current) < 1e-12
+    assert abs(m["costs"]["1000"]["payback_h"] - 0.0004 / current) < 1e-6
+    assert m["trend"] == "UP" and m["trend_delta_apy"] > 0.02

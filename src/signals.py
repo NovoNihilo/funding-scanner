@@ -1,34 +1,40 @@
 """Signal engine.
 
 For each matched asset and each (long venue, short venue) orientation with a leg on REQUIRED_VENUE (if set):
-1. Build comparable funding periods. The grid is the coarser leg's settlement schedule:
-   hourly for Hyperliquid/Lighter pairs, Variational's own settlement times (1h/4h/8h) otherwise.
-   A period is complete only when every settlement both legs owe in it exists; nothing is zero-filled.
-   period net = sum(short-leg rates) - sum(long-leg rates)  (fraction of one leg's notional).
-2. Exclude dividend-window periods (Variational tradfi interval switch) and extreme outliers.
-3. Lifecycle: a run starts at the first positive period and ends after TERMINATE_AFTER consecutive
-   non-positive periods. Missing and excluded periods neither count nor reset.
-4. Gates (after 24h of run age): conservative funding > 0, capital APY at 1x >= MIN_APY_1X,
-   consistency, data coverage, tradable markets. Gates judge the FUNDING signal only.
+1. Build an HOURLY funding series. Each hour pairs the Hyperliquid/Lighter hourly settlement with the
+   Variational leg's LAST KNOWN settlement at or before that hour, converted to a per-hour rate and held until
+   the next settlement (never longer than its interval + 1h). Missing hours stay missing; nothing is zero-filled.
+   hour net = short-leg hourly rate - long-leg hourly rate  (fraction of one leg's notional).
+2. Exclude dividend-window hours (Variational tradfi interval switch) and extreme outliers.
+3. Lifecycle: a run starts at the first positive hour and is killed after TERMINATE_AFTER consecutive
+   non-positive hours; the next positive hour starts a new run from zero. Missing/excluded hours neither
+   count nor reset.
+4. Status: MONITORING -> EMERGING (run 8-24h old, passing the gates on the run so far) -> QUALIFIED (run 24h+,
+   conservative funding = min(48h, 7d) average, plus consistency and coverage gates) -> SUSPENDED if a qualified
+   run later fails a gate; TERMINATED when the run is killed. Gates judge the FUNDING signal only.
 5. Execution economics are informational and never block a signal: round-trip cost (taker worst case and
-   maker best case), payback ETA, expected 24h net and expected net over HOLD_HORIZON_H (used for ranking).
+   maker best case), payback ETA at the CURRENT rate (24h average), expected 24h net, expected net over
+   HOLD_HORIZON_H at the conservative rate (used for ranking). Trend: last 12h vs the 24h before it.
 6. Leverage range: 1x up to min(venue limits, MAX_LEVERAGE_CAP, 24h-stress-safe leverage).
 """
 import json
 import time
+from bisect import bisect_right
 from collections import Counter
 from itertools import permutations
 from statistics import median
 
-from src.config import (ANOMALY_MAD_K, ANOMALY_MIN_HOURLY, APY_BASIS, COST_MAX_AGE_S, COST_SIZES, HOLD_HORIZON_H,
-                        MAX_LEVERAGE_CAP, MIN_APY_1X, MIN_COVERAGE, MIN_POSITIVE_SHARE, PAYBACK_FAST_H,
-                        PAYBACK_OK_H, PRIMARY_SIZE, REQUIRED_VENUE, SIGNAL_LOOKBACK_DAYS, TERMINATE_AFTER)
+from src.config import (ANOMALY_MAD_K, ANOMALY_MIN_HOURLY, APY_BASIS, COST_MAX_AGE_S, COST_SIZES, EMERGING_MIN_H,
+                        HOLD_HORIZON_H, MAX_LEVERAGE_CAP, MIN_APY_1X, MIN_COVERAGE, MIN_POSITIVE_SHARE,
+                        PAYBACK_FAST_H, PAYBACK_OK_H, PRIMARY_SIZE, QUALIFY_MIN_H, REQUIRED_VENUE,
+                        SIGNAL_LOOKBACK_DAYS, TERMINATE_AFTER, TREND_APY_DELTA, TREND_PRIOR_H, TREND_RECENT_H)
 from src.costs import stress_leverage
 
 HOUR = 3600
 BLOCKING_FLAGS = {"REDUCE_ONLY", "HIDDEN", "PREIPO", "NO_FUNDING"}
-COHORTS = ((24, "FRESH"), (48, "ACTIONABLE"), (168, "ESTABLISHED"))
+COHORTS = ((EMERGING_MIN_H, "FRESH"), (QUALIFY_MIN_H, "EMERGING"), (48, "ACTIONABLE"), (168, "ESTABLISHED"))
 COST_CANDIDATE_FRACTION = 0.8  # fetch execution costs for pairs within 80% of the APY minimum
+STALE_AFTER_H = 3  # no complete hour for this long -> stale
 
 
 # ---------------- periods ----------------
@@ -37,13 +43,28 @@ def _period(end, hours, net, quality, tags=()):
     return {"end": end, "hours": hours, "net": net, "quality": quality, "tags": set(tags), "excluded": False}
 
 
-def build_periods(long_r, short_r, grid):
-    """long_r/short_r: {ts: (rate, interval_s, quality)}. grid: None (both hourly), 'long' or 'short'
-    (that leg is the coarse Variational leg). Returns periods sorted by end time."""
+def var_hourly(var_r, keys, t):
+    """Variational leg for the hour ending t: (per-hour rate, settlement ts, interval_s) of the last known
+    settlement at or before t, or None if there is none or it is older than its interval + 1h (a missed one)."""
+    i = bisect_right(keys, t) - 1
+    if i < 0:
+        return None
+    ts = keys[i]
+    rate, ivl, _ = var_r[ts]
+    ivl = ivl or HOUR
+    if t - ts > ivl + HOUR:
+        return None
+    return rate / (ivl / HOUR), ts, ivl
+
+
+def build_periods(long_r, short_r, var_leg=None, normal_interval=None):
+    """Hourly periods. long_r/short_r: {ts: (rate per interval, interval_s, quality)}.
+    var_leg: None (both legs hourly), 'long' or 'short' (that leg is Variational, held forward hour by hour).
+    normal_interval: Variational tradfi interval; hours priced off a shorter (dividend-window) settlement are excluded."""
     if not long_r or not short_r:
         return []
     out = []
-    if grid is None:
+    if var_leg is None:
         start, end = max(min(long_r), min(short_r)), max(max(long_r), max(short_r))
         for t in range(start, end + 1, HOUR):
             if t in long_r and t in short_r:
@@ -52,33 +73,22 @@ def build_periods(long_r, short_r, grid):
             else:
                 out.append(_period(t, 1.0, None, None))
         return out
-    coarse, fine = (long_r, short_r) if grid == "long" else (short_r, long_r)
-    for t in sorted(coarse):
-        rate_c, ivl, q_c = coarse[t]
-        hours = max(1, int(round(ivl / HOUR)))
-        needed = [t - k * HOUR for k in range(hours)]
-        if all(x in fine for x in needed):
-            s_fine = sum(fine[x][0] for x in needed)
-            net = (rate_c - s_fine) if grid == "short" else (s_fine - rate_c)
-            q = "ESTIMATED" if "ESTIMATED" in [q_c] + [fine[x][2] for x in needed] else "CONFIRMED"
-            out.append(_period(t, float(hours), net, q))
-        else:
-            out.append(_period(t, float(hours), None, None))
-    return out
-
-
-def mark_dividend_windows(periods, coarse_r, normal_interval):
-    """Variational tradfi: settlements on a shortened interval are the dividend window -> exclude."""
-    if not normal_interval:
-        return 0
-    n = 0
-    for p in periods:
-        row = coarse_r.get(p["end"])
-        if row and row[1] < normal_interval:
+    var_r, fine = (long_r, short_r) if var_leg == "long" else (short_r, long_r)
+    keys = sorted(var_r)
+    for t in range(max(min(fine), keys[0]), max(fine) + 1, HOUR):
+        v = var_hourly(var_r, keys, t)
+        if t not in fine or v is None:
+            out.append(_period(t, 1.0, None, None))
+            continue
+        vh, ts, ivl = v
+        f = fine[t][0]
+        p = _period(t, 1.0, (f - vh) if var_leg == "long" else (vh - f), "ESTIMATED")
+        p["var_ts"] = ts
+        if normal_interval and ivl < normal_interval:
             p["tags"].add("DIVIDEND")
             p["excluded"] = True
-            n += 1
-    return n
+        out.append(p)
+    return out
 
 
 def mark_anomalies(periods):
@@ -171,15 +181,17 @@ def payback_tier(hours):
     return "FAST" if hours <= PAYBACK_FAST_H else ("OK" if hours <= PAYBACK_OK_H else "SLOW")
 
 
-def pair_costs(lg, sh, lg_costs, sh_costs, conservative):
-    """Per size: round-trip cost (USD) taker/maker, payback ETA (hours) taker/maker, expected 24h net and
-    expected net over HOLD_HORIZON_H (taker, USD), adverse basis (bps). lg_costs/sh_costs: {size: book_costs row}.
+def pair_costs(lg, sh, lg_costs, sh_costs, rate_now, rate_hold=None):
+    """Per size: round-trip cost (USD) taker/maker, payback ETA (hours) taker/maker and expected 24h net at the
+    CURRENT hourly rate, expected net over HOLD_HORIZON_H at the conservative rate (taker, USD), adverse basis (bps).
+    lg_costs/sh_costs: {size: book_costs row}.
     Adverse basis = long venue priced above short venue at entry (assumed to converge by exit);
     a favourable basis is not counted as profit."""
     out, flags = {}, set()
+    rate_hold = rate_now if rate_hold is None else rate_hold
 
     def payback(frac):
-        return frac / conservative if conservative and conservative > 0 else None
+        return frac / rate_now if rate_now and rate_now > 0 else None
 
     for size in COST_SIZES:
         cl, cs = lg_costs.get(size), sh_costs.get(size)
@@ -200,13 +212,12 @@ def pair_costs(lg, sh, lg_costs, sh_costs, conservative):
         mk_l = cl["rt_cost_maker"] if cl["rt_cost_maker"] is not None else cl["rt_cost"]
         mk_s = cs["rt_cost_maker"] if cs["rt_cost_maker"] is not None else cs["rt_cost"]
         frac_mk = mk_l + mk_s + adverse
-        ok = conservative is not None
         out[size] = {"status": "OK", "cost_usd": frac * size, "cost_usd_maker": frac_mk * size,
                      "cost_bps": frac * 1e4, "basis_bps": basis * 1e4,
                      "payback_h": payback(frac), "payback_h_maker": payback(frac_mk),
                      "payback_tier": payback_tier(payback(frac)),
-                     "net24_usd": (conservative * 24 - frac) * size if ok else None,
-                     "net_hold_usd": (conservative * HOLD_HORIZON_H - frac) * size if ok else None}
+                     "net24_usd": (rate_now * 24 - frac) * size if rate_now is not None else None,
+                     "net_hold_usd": (rate_hold * HOLD_HORIZON_H - frac) * size if rate_hold is not None else None}
     return out, sorted(flags)
 
 
@@ -215,20 +226,30 @@ def _normal_interval(rates):
     return c.most_common(1)[0][0] if c else None
 
 
+def trend_of(periods, now):
+    """UP / DOWN / STABLE: APY at 1x over the last TREND_RECENT_H vs the TREND_PRIOR_H before it."""
+    rec = window_stats(periods, now, TREND_RECENT_H)
+    pri = window_stats(periods, now - TREND_RECENT_H * HOUR, TREND_PRIOR_H)
+    if rec["valid_hours"] < TREND_RECENT_H / 2 or pri["valid_hours"] < TREND_PRIOR_H / 3:
+        return None, None
+    delta = apy_numbers(rec["avg_hourly"], 1)[1] - apy_numbers(pri["avg_hourly"], 1)[1]
+    return ("UP" if delta > TREND_APY_DELTA else "DOWN" if delta < -TREND_APY_DELTA else "STABLE"), delta
+
+
 def evaluate_pair(lg, sh, long_r, short_r, now, lg_costs=None, sh_costs=None, p99=None):
     """lg/sh: market rows (dict-like) for long and short legs. Returns signal dict (without stored state)."""
-    grid = "long" if lg["venue"] == "variational" else ("short" if sh["venue"] == "variational" else None)
-    periods = build_periods(long_r, short_r, grid)
-    flags, reasons = set(), []
-    div_n = 0
-    if grid:
-        var_leg, var_r = (lg, long_r) if grid == "long" else (sh, short_r)
-        if var_leg["asset_class"] == "tradfi":
-            normal = _normal_interval(var_r)
-            div_n = mark_dividend_windows(periods, var_r, normal)
-            if normal and var_leg["interval_s"] and var_leg["interval_s"] < normal:
+    var_leg = "long" if lg["venue"] == "variational" else ("short" if sh["venue"] == "variational" else None)
+    flags, hard = set(), []
+    normal = None
+    if var_leg:
+        vm, vr = (lg, long_r) if var_leg == "long" else (sh, short_r)
+        if vm["asset_class"] == "tradfi":
+            normal = _normal_interval(vr)
+            if normal and vm["interval_s"] and vm["interval_s"] < normal:
                 flags.add("DIV_IMMINENT")
         flags.update({"TOS_RISK", "ESTIMATED_DATA"})
+    periods = [p for p in build_periods(long_r, short_r, var_leg, normal) if p["end"] <= now]
+    div_n = sum(1 for p in periods if "DIVIDEND" in p["tags"])
     anom_n = mark_anomalies(periods)
     if div_n:
         flags.add(f"DIV_EXCLUDED={div_n}")
@@ -241,37 +262,60 @@ def evaluate_pair(lg, sh, long_r, short_r, now, lg_costs=None, sh_costs=None, p9
         for f in (m["flags"] or "").split(","):
             if f in BLOCKING_FLAGS:
                 flags.add(f"{m['venue'][:3].upper()}_{f}")
-                reasons.append(f"{m['venue']} {f}")
+                hard.append(f"{m['venue']} {f}")
 
     w24, w48, w7 = (window_stats(periods, now, h) for h in (24, 48, 168))
     candidates = [w["avg_hourly"] for w in (w48, w7) if w["avg_hourly"] is not None and w["valid_hours"] >= 24]
     conservative = min(candidates) if candidates else None
+    current = w24["avg_hourly"] if w24["valid_hours"] >= EMERGING_MIN_H else None
+    shown = conservative if conservative is not None else current  # APY shown: conservative once 24h exist
+    if conservative is None and current is not None:
+        flags.add("EARLY_APY")
     stress_lev, stress_move = stress_leverage(p99, [(lg["venue"], lg["max_leverage"]),
                                                     (sh["venue"], sh["max_leverage"])])
     max_lev = min(leverage_limit(lg["max_leverage"], sh["max_leverage"]), stress_lev)
     if p99 is None:
         flags.add("STRESS_DEFAULT")
-    spread_apr, apy_1x, apy_max = apy_numbers(conservative, max_lev) if conservative is not None else (None,) * 3
+    spread_apr, apy_1x, apy_max = apy_numbers(shown, max_lev) if shown is not None else (None,) * 3
 
     run_start, neg, terms, longest_neg = lifecycle(periods)
     complete = [p for p in periods if p["net"] is not None]
     last_end = complete[-1]["end"] if complete else None
-    grid_h = max((p["hours"] for p in periods), default=1.0)
     age_h = (now - run_start) / HOUR if run_start is not None else 0.0
+    if last_end is None or now - last_end > STALE_AFTER_H * HOUR:
+        hard.append("stale data")
 
+    # QUALIFIED gates (run 24h+): conservative rate over 48h / 7d
+    qualify = list(hard)
     if conservative is None or conservative <= 0:
-        reasons.append("conservative funding <= 0")
-    elif apy_1x < MIN_APY_1X:
-        reasons.append(f"APY 1x {apy_1x:.1%} < {MIN_APY_1X:.0%}")
+        qualify.append("conservative funding <= 0")
+    elif apy_numbers(conservative, 1)[1] < MIN_APY_1X:
+        qualify.append(f"APY 1x {apy_numbers(conservative, 1)[1]:.1%} < {MIN_APY_1X:.0%}")
     if w48["pos_share"] is None or w48["pos_share"] < MIN_POSITIVE_SHARE:
-        reasons.append(f"consistency: positive share < {MIN_POSITIVE_SHARE:.0%} (48h)")
+        qualify.append(f"consistency: positive share < {MIN_POSITIVE_SHARE:.0%} (48h)")
     if w48["median_hourly"] is None or w48["median_hourly"] <= 0:
-        reasons.append("median period net <= 0 (48h)")
+        qualify.append("median hourly net <= 0 (48h)")
     if w24["coverage"] < MIN_COVERAGE:
-        reasons.append(f"coverage {w24['coverage']:.0%} < {MIN_COVERAGE:.0%} (24h)")
-    if last_end is None or now - last_end > max(2 * grid_h, 3) * HOUR:
-        reasons.append("stale data")
-    costs, cost_flags = pair_costs(lg, sh, lg_costs or {}, sh_costs or {}, conservative)
+        qualify.append(f"coverage {w24['coverage']:.0%} < {MIN_COVERAGE:.0%} (24h)")
+
+    # EMERGING gates (run 8-24h): the same tests on the run so far
+    emerging = list(hard)
+    run = window_stats(periods, now, max(1, int(age_h))) if run_start is not None else None
+    if run is None or run["avg_hourly"] is None or run["avg_hourly"] <= 0:
+        emerging.append("run funding <= 0")
+    else:
+        if apy_numbers(run["avg_hourly"], 1)[1] < MIN_APY_1X:
+            emerging.append(f"run APY 1x {apy_numbers(run['avg_hourly'], 1)[1]:.1%} < {MIN_APY_1X:.0%}")
+        if run["pos_share"] < MIN_POSITIVE_SHARE:
+            emerging.append(f"consistency: positive share < {MIN_POSITIVE_SHARE:.0%} (run)")
+        if run["coverage"] < MIN_COVERAGE:
+            emerging.append(f"coverage {run['coverage']:.0%} < {MIN_COVERAGE:.0%} (run)")
+    reasons = qualify if age_h >= QUALIFY_MIN_H else emerging
+
+    trend, trend_delta = trend_of(periods, now)
+    rate_now = current if current is not None else conservative
+    costs, cost_flags = pair_costs(lg, sh, lg_costs or {}, sh_costs or {}, rate_now,
+                                   conservative if conservative is not None else current)
     flags.update(f"Q_{f}" for f in cost_flags if f != "INDICATIVE")
     primary = costs.get(PRIMARY_SIZE, {"status": "MISSING"})
     if primary["status"] == "NO_DEPTH":
@@ -279,13 +323,16 @@ def evaluate_pair(lg, sh, long_r, short_r, now, lg_costs=None, sh_costs=None, p9
 
     metrics = {
         "avg_hourly_24h": w24["avg_hourly"], "avg_hourly_48h": w48["avg_hourly"], "avg_hourly_7d": w7["avg_hourly"],
-        "conservative_hourly": conservative, "spread_apr": spread_apr,
-        "daily_net_per_1k": conservative * 24 * 1000 if conservative is not None else None,
+        "conservative_hourly": conservative, "current_hourly": current, "spread_apr": spread_apr,
+        "apy_now_1x": apy_numbers(current, 1)[1] if current is not None else None,
+        "run_apy_1x": apy_numbers(run["avg_hourly"], 1)[1] if run and run["avg_hourly"] is not None else None,
+        "trend": trend, "trend_delta_apy": trend_delta,
+        "daily_net_per_1k": shown * 24 * 1000 if shown is not None else None,
         "pos_share_48h": w48["pos_share"], "pos_share_7d": w7["pos_share"],
         "coverage_24h": w24["coverage"], "coverage_7d": w7["coverage"],
         "history_hours": w7["valid_hours"], "history_needed_hours": 24,
         "longest_neg_hours": longest_neg, "terminations": len(terms),
-        "last_termination": terms[-1] if terms else None, "last_period_end": last_end, "grid_hours": grid_h,
+        "last_termination": terms[-1] if terms else None, "last_period_end": last_end,
         "stress_move": stress_move, "stress_lev": stress_lev,
         "costs": {str(int(k)): v for k, v in costs.items()},
         "rank_net_hold_usd": primary.get("net_hold_usd"),
@@ -302,8 +349,10 @@ def decide_status(sig, prev):
     cohort = cohort_for(sig["age_h"])
     same_run = prev is not None and prev["run_start"] == sig["run_start"]
     qualified_at = prev["qualified_at"] if same_run else None
-    if sig["age_h"] < 24:
+    if sig["age_h"] < EMERGING_MIN_H:
         return "MONITORING", cohort, qualified_at
+    if sig["age_h"] < QUALIFY_MIN_H:
+        return ("EMERGING" if not sig["reasons"] else "MONITORING"), cohort, qualified_at
     if not sig["reasons"]:
         return "QUALIFIED", cohort, qualified_at
     return ("SUSPENDED" if qualified_at else "MONITORING"), cohort, qualified_at
@@ -376,7 +425,7 @@ def evaluate_all(conn, now=None, persist=True):
             if status != old_status:
                 detail = "; ".join(sig["reasons"]) if status in ("SUSPENDED", "MONITORING") else ""
                 if status == "TERMINATED":
-                    detail = f"{TERMINATE_AFTER} consecutive non-positive periods"
+                    detail = f"killed: {TERMINATE_AFTER} consecutive non-positive hours"
                 events.append((pair_id, now, "STATUS", old_status, status, detail))
             elif status == "QUALIFIED" and prev and cohort != prev["cohort"]:
                 events.append((pair_id, now, "COHORT", prev["cohort"], cohort, ""))

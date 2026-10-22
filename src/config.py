@@ -24,7 +24,12 @@ APY_BASIS = os.environ.get("APY_BASIS", "capital")  # 'capital' (total collatera
 MAX_LEVERAGE_CAP = float(os.environ.get("MAX_LEVERAGE_CAP", "5"))
 
 # Signal lifecycle
-TERMINATE_AFTER = int(os.environ.get("TERMINATE_AFTER", "3"))  # consecutive non-positive periods
+TERMINATE_AFTER = int(os.environ.get("TERMINATE_AFTER", "3"))  # consecutive non-positive HOURS kill a run
+EMERGING_MIN_H = float(os.environ.get("EMERGING_MIN_H", "8"))  # runs this old (and < 24h) can be EMERGING
+QUALIFY_MIN_H = float(os.environ.get("QUALIFY_MIN_H", "24"))  # runs this old can be QUALIFIED
+TREND_RECENT_H = int(os.environ.get("TREND_RECENT_H", "12"))  # trend: last 12h vs the 24h before it
+TREND_PRIOR_H = int(os.environ.get("TREND_PRIOR_H", "24"))
+TREND_APY_DELTA = float(os.environ.get("TREND_APY_DELTA", "0.02"))  # +/-2 APY points (1x) = UP / DOWN
 MIN_POSITIVE_SHARE = float(os.environ.get("MIN_POSITIVE_SHARE", "0.6"))  # of valid hours, last 48h
 MIN_COVERAGE = float(os.environ.get("MIN_COVERAGE", "0.9"))  # valid data hours / window hours, last 24h
 SIGNAL_LOOKBACK_DAYS = float(os.environ.get("SIGNAL_LOOKBACK_DAYS", "14"))

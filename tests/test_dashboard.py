@@ -68,7 +68,12 @@ def seeded(monkeypatch):
 
 def test_page_renders_signals_health_and_events(seeded):
     conn, now = seeded
+    conn.execute("INSERT INTO signal_events (pair_id, ts, event, from_status, to_status, detail) VALUES "
+                 "('AAA|hyperliquid:AAA>lighter:AAA', ?, 'STATUS', 'EMERGING', 'QUALIFIED', '')", (now,))
+    conn.execute("INSERT INTO signal_events (pair_id, ts, event, from_status, to_status, detail) VALUES "
+                 "('ZZZ|hyperliquid:ZZZ>lighter:ZZZ', ?, 'STATUS', 'MONITORING', 'QUALIFIED', '')", (now,))
     page = build_page(conn, now=now, db_path=":memory:")
+    assert "EMERGING &rarr;" in page and "ZZZ" not in page  # real change shown; dropped pair hidden
     assert page.startswith("<!doctype html>") and "Funding scanner" in page
     assert "<b>AAA</b>" in page and "QUALIFIED" in page and "Recent signal changes" in page
     assert 'class="chip st-ok">OK' in page  # fresh snapshot, recent sync, nothing missed

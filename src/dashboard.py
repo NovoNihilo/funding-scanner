@@ -16,7 +16,8 @@ HOUR = 3600
 LABEL = {"hyperliquid": "HL", "lighter": "LT", "variational": "VAR"}
 HIDDEN_FLAGS = {"ESTIMATED_DATA", "TOS_RISK"}  # TOS_RISK applies to every Variational pair: shown once in the header
 SZ = str(int(PRIMARY_SIZE))
-STATUS_ORDER = {"QUALIFIED": 0, "SUSPENDED": 1, "MONITORING": 2, "TERMINATED": 3}
+STATUS_ORDER = {"QUALIFIED": 0, "EMERGING": 1, "SUSPENDED": 2, "MONITORING": 3, "TERMINATED": 4}
+TREND = {"UP": ("&#9650; up", "t-up"), "DOWN": ("&#9660; down", "t-down"), "STABLE": ("&#9644; stable", "t-flat")}
 
 
 # ---------------- data ----------------
@@ -136,11 +137,21 @@ def num(x, default=-1e18):
     return default if x is None else x
 
 
+def trend_td(m):
+    t = m.get("trend")
+    if t not in TREND:
+        return td('<span class="muted">n/a</span>', -1e18)
+    label, cls = TREND[t]
+    d = m.get("trend_delta_apy") or 0
+    return td(f'<span class="{cls}" title="APY 1x, last 12h vs prior 24h">{label} {d * 100:+.1f}</span>', d)
+
+
 # ---------------- sections ----------------
 
 def pair_table(rows, classes, with_reasons, empty):
     head = ("<tr><th>Asset</th><th>Class</th><th>Long</th><th>Short</th><th>Status</th><th>Cohort</th>"
-            "<th>Age</th><th>APY 1x</th><th>APY range</th><th>Cost (taker / maker)</th><th>Payback t / m</th>"
+            "<th>Age</th><th>APY 1x</th><th>APY range</th><th>Trend</th><th>Cost (taker / maker)</th>"
+            "<th>Payback at current rate (t / m)</th>"
             f"<th>Net 24h</th><th>Net {HOLD_HORIZON_H:.0f}h</th><th>Basis</th><th>Flags{' / reasons' if with_reasons else ''}</th></tr>")
     if not rows:
         return f'<p class="empty">{esc(empty)}</p>'
@@ -165,6 +176,7 @@ def pair_table(rows, classes, with_reasons, empty):
             + td(f"{r['age_h'] or 0:.0f}h", r["age_h"] or 0, "n")
             + td(pct(r["apy_1x"]), num(r["apy_1x"]), "n")
             + td(f"{pct(r['apy_1x'])} &ndash; {pct(r['apy_max'])} @ {lev}x", num(r["apy_max"]), "n")
+            + trend_td(m)
             + td(f"{usd(c.get('cost_usd'))} / {usd(c.get('cost_usd_maker'))}" if ok else esc(c.get("status", "n/a")),
                  num(c.get("cost_usd"), 1e18), "n")
             + td(f"{hrs(c.get('payback_h'))} / {hrs(c.get('payback_h_maker'))}" if ok else "n/a",
@@ -191,8 +203,8 @@ def warming_section(rows):
     order = ["0h", "1-7h", "8-15h", "16-23h", "not yet evaluated"]
     cells = "".join(f'<div class="stat"><span>{esc(k)}</span><b>{buckets[k]}</b></div>' for k in order if buckets[k])
     return (f'<section><h2>Warming up <small>{len(rows)} pairs without an APY yet</small></h2>'
-            f'<p class="hint">A pair gets an APY once it has 24h of comparable funding history. Variational adds '
-            f'4h or 8h per settlement, so pairs fill in steps. Most advanced pair: {best:.0f}h of 24h.</p>'
+            f'<p class="hint">History grows by one hour per hour. A pair shows an early APY after 8h of '
+            f'comparable history and its conservative APY after 24h. Most advanced pair: {best:.0f}h of 24h.</p>'
             f'<div class="stats">{cells}</div></section>')
 
 
@@ -230,8 +242,10 @@ def health_section(h, now):
             f'{h["status"]}</span></h2><ul class="issues">{rows}</ul><div class="stats">{cells}</div>{miss}</section>')
 
 
-def events_section(conn):
-    rows = conn.execute("SELECT * FROM signal_events ORDER BY id DESC LIMIT 40").fetchall()
+def events_section(conn, live):
+    """Real status changes (not first sightings) on pairs that are still tracked."""
+    rows = [e for e in conn.execute("SELECT * FROM signal_events WHERE from_status IS NOT NULL ORDER BY id DESC "
+                                    "LIMIT 400") if e["pair_id"] in live][:40]
     if not rows:
         return ""
     out = []
@@ -255,7 +269,8 @@ def build_page(conn, now=None, db_path=None):
     asof = max((r["updated_at"] for r in sigs), default=None)
     qualified = sorted((r for r in sigs if r["status"] == "QUALIFIED"),
                        key=lambda r: -num(json.loads(r["metrics"] or "{}").get("rank_net_hold_usd")))
-    watch = sorted((r for r in sigs if r["status"] != "QUALIFIED" and r["apy_1x"] is not None),
+    emerging = sorted((r for r in sigs if r["status"] == "EMERGING"), key=lambda r: -num(r["apy_1x"]))
+    watch = sorted((r for r in sigs if r["status"] not in ("QUALIFIED", "EMERGING") and r["apy_1x"] is not None),
                    key=lambda r: -r["apy_1x"])[:40]
     warming = [r for r in sigs if r["apy_1x"] is None and r["status"] != "TERMINATED"]
     counts = Counter(r["status"] for r in sigs)
@@ -269,7 +284,8 @@ def build_page(conn, now=None, db_path=None):
   <div><h1>Funding scanner</h1>
   <p class="sub">Signals as of {ts_tag(asof)} &middot; page built {ts_tag(now)} &middot; {len(sigs)} pairs: {summary}</p>
   <p class="sub">APY on {esc(APY_BASIS)} &middot; minimum {MIN_APY_1X:.0%} at 1x &middot; costs at ${PRIMARY_SIZE:,.0f} per leg &middot;
-  ranking = expected net over {HOLD_HORIZON_H:.0f}h after taker costs</p></div>
+  ranking = expected net over {HOLD_HORIZON_H:.0f}h after taker costs &middot;
+  a run is killed after 3 non-profitable hours</p></div>
   <div class="controls"><input id="q" type="search" placeholder="Filter asset or market">
   <select id="cls"><option value="">All classes</option><option value="crypto">Crypto</option>
   <option value="tradfi">RWA</option></select></div>
@@ -278,10 +294,12 @@ def build_page(conn, now=None, db_path=None):
 {health_section(h, now)}
 <section><h2>Qualified <small>{len(qualified)}</small></h2>
 {pair_table(qualified, classes, False, "No qualified pairs right now.")}</section>
-<section><h2>Watchlist <small>top {len(watch)} non-qualified by APY</small></h2>
+<section><h2>Emerging <small>{len(emerging)} &middot; profitable 8-24h, passing the gates so far</small></h2>
+{pair_table(emerging, classes, False, "No emerging pairs right now.")}</section>
+<section><h2>Watchlist <small>top {len(watch)} others by APY</small></h2>
 {pair_table(watch, classes, True, "No pairs with an APY yet.")}</section>
 {warming_section(warming)}
-{events_section(conn)}
+{events_section(conn, {r["pair_id"] for r in sigs})}
 """
     return PAGE.replace("{{BODY}}", body)
 
@@ -309,7 +327,8 @@ td.n{text-align:right;font-variant-numeric:tabular-nums}.notes{color:var(--muted
 .s-qualified,.st-ok{background:var(--okbg);color:var(--ok)}.s-suspended,.st-warn{background:var(--warnbg);color:var(--warn)}
 .s-terminated,.st-fail{background:var(--failbg);color:var(--fail)}
 .v{font-size:11px;font-weight:700;padding:0 5px;border-radius:4px;border:1px solid var(--line);color:var(--muted)}
-.v-var{color:var(--accent);border-color:var(--accent)}
+.v-var{color:var(--accent);border-color:var(--accent)}.s-emerging{background:var(--line);color:var(--accent)}
+.t-up{color:var(--ok)}.t-down{color:var(--fail)}.t-flat,.muted{color:var(--muted)}
 .stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin-top:10px}
 .stat{border:1px solid var(--line);border-radius:8px;padding:8px}.stat span{display:block;color:var(--muted);font-size:12px}
 .issues{list-style:none;padding:0;margin:0}.issues li{padding:4px 0}.i-fail b{color:var(--fail)}.i-warn b{color:var(--warn)}

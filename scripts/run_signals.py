@@ -73,11 +73,13 @@ def main():
     print(f"matched assets by class={dict(cls)}  matched HIP-3 markets={hip3}")
 
     rows = conn.execute("SELECT * FROM signals WHERE apy_1x IS NOT NULL").fetchall()
-    head = (f"{'asset':<9}{'pair':<13}{'status':<11}{'cohort':<12}{'age':>4}{'APY1x':>7}  {'range':<15}"
+    head = (f"{'asset':<9}{'pair':<13}{'status':<11}{'cohort':<12}{'age':>4}{'APY1x':>7}  {'range':<15}{'trend':<7}"
             f"{'cost':>7}{'payback t/m':>13}{'net24':>8}{'net hold':>9}{'basis':>8}  flags / reasons")
     sections = (("QUALIFIED (ranked by expected net over hold)", [r for r in rows if r["status"] == "QUALIFIED"],
                  rank_key),
-                ("TOP NON-QUALIFIED (by APY)", [r for r in rows if r["status"] != "QUALIFIED"],
+                ("EMERGING (profitable 8-24h, by APY)", [r for r in rows if r["status"] == "EMERGING"],
+                 lambda r: -r["apy_1x"]),
+                ("TOP OTHERS (by APY)", [r for r in rows if r["status"] not in ("QUALIFIED", "EMERGING")],
                  lambda r: -r["apy_1x"]))
     for title, sel_all, key in sections:
         sel = sorted(sel_all, key=key)[:15]
@@ -89,10 +91,11 @@ def main():
             rng = f"{pct(r['apy_1x']).strip()}-{pct(r['apy_max']).strip()} {int(r['max_lev'])}x"
             basis = f"{c['basis_bps']:5.1f}bp" if c.get("status") == "OK" else "n/a"
             flags = [f for f in (r["flags"] or "").split(",") if f and f not in ("ESTIMATED_DATA", "TOS_RISK")]
-            extra = flags + ([] if r["status"] == "QUALIFIED" else json.loads(r["reasons"])[:2])
+            extra = flags + ([] if r["status"] in ("QUALIFIED", "EMERGING") else json.loads(r["reasons"])[:2])
             pair = vl(r["long_venue"], r["long_symbol"]) + ">" + vl(r["short_venue"], r["short_symbol"])
             print(f"{r['asset']:<9}{pair:<13}"
                   f"{r['status']:<11}{(r['cohort'] or '-'):<12}{r['age_h']:>4.0f}{pct(r['apy_1x']):>7}  {rng:<15}"
+                  f"{(m.get('trend') or 'n/a'):<7}"
                   f"{money(c.get('cost_usd'))}{eta(c):>13}{money(c.get('net24_usd')):>8}"
                   f"{money(c.get('net_hold_usd')):>9}{basis:>8}  {'; '.join(extra)}")
 
