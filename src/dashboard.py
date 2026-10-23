@@ -9,11 +9,11 @@ import re
 import shutil
 import time
 from collections import Counter
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from src.config import (APY_BASIS, DB_PATH, HOLD_HORIZON_H, MAX_LEVERAGE_CAP, MIN_APY_1X, PRIMARY_SIZE,
-                        REQUIRED_VENUE, SIGNAL_LOOKBACK_DAYS, TERMINATE_AFTER)
+from src.config import (APY_BASIS, DB_PATH, EMERGING_MIN_H, HOLD_HORIZON_H, MAX_LEVERAGE_CAP, MIN_APY_1X,
+                        PRIMARY_SIZE, REQUIRED_VENUE, SIGNAL_LOOKBACK_DAYS, TERMINATE_AFTER)
 from src.db import connect
 from src.funding import completeness, upcoming_settlements
 from src.signals import _load, _normal_interval, build_periods, lifecycle, mark_anomalies, var_hourly
@@ -371,6 +371,8 @@ def pair_rows(rows, classes, series, with_reasons):
         ]
         if with_reasons:
             reasons = [humanize(x) for x in json.loads(r["reasons"] or "[]")]
+            if not reasons and r["status"] == "MONITORING" and (r["age_h"] or 0) < EMERGING_MIN_H:
+                reasons = [f"Run is {r['age_h'] or 0:.0f}h old; it can emerge at {EMERGING_MIN_H:.0f}h"]
             cells.append(f'<td class="c-why"><span class="chip s-{esc(r["status"].lower())}">'
                          f'{esc(STATUS.get(r["status"], r["status"]))}</span>'
                          f'<span class="why">{esc(reasons[0] if reasons else "")}</span></td>')
@@ -523,7 +525,7 @@ def build_page(conn, now=None, db_path=None):
     body = f"""
 <header class="top">
   <div class="brand"><h1>Funding scanner</h1>
-    <p>Signals updated {ts_tag(asof)} &#8211; checked hourly</p></div>
+    <p>Signals for the hour ending {ts_tag(asof)} &#8211; updated hourly</p></div>
   <button class="health-pill hp-{hl[0]}" data-goto="health"><span class="ic" aria-hidden="true">{hl[1]}</span>{hl[2]}</button>
 </header>
 <nav class="bar">
@@ -776,6 +778,8 @@ setInterval(function(){if(!drawer.classList.contains('is-open')&&document.active
 # ---------------- server ----------------
 
 class _Handler(BaseHTTPRequestHandler):
+    timeout = 15  # drop idle connections (browsers open some in advance) so they can never hold the server
+
     def _send(self, code, body, ctype):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -786,29 +790,35 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         url = urlparse(self.path)
+        conn = None
         try:
+            conn = connect(self.server.db_path)  # one connection per request: requests run on their own threads
             if url.path in ("/", "/index.html"):
-                self._send(200, build_page(self.server.conn, db_path=self.server.db_path).encode(),
-                           "text/html; charset=utf-8")
+                self._send(200, build_page(conn, db_path=self.server.db_path).encode(), "text/html; charset=utf-8")
             elif url.path == "/api/pair":
                 pid = (parse_qs(url.query).get("id") or [""])[0]
-                d = pair_detail(self.server.conn, pid)
+                d = pair_detail(conn, pid)
                 body = json.dumps(d if d is not None else {"error": "This pair is no longer tracked."})
                 self._send(200 if d is not None else 404, body.encode(), "application/json")
             else:
                 self.send_error(404)
         except Exception as e:  # show the error instead of a blank page; the worker keeps running
             self._send(500, f"<pre>dashboard error: {html.escape(repr(e))}</pre>".encode(), "text/html; charset=utf-8")
+        finally:
+            if conn is not None:
+                conn.close()
 
     def log_message(self, *args):
         pass
 
 
 def serve(host, port, stop=None, db_path=None):
-    """Single-threaded server: requests are handled one at a time on this thread (its own DB connection)."""
-    srv = HTTPServer((host, port), _Handler)
+    """Threaded server: each request runs on its own thread with its own read connection, and idle connections
+    time out, so a slow or half-open browser connection can never block the page."""
+    ThreadingHTTPServer.allow_reuse_address = True
+    srv = ThreadingHTTPServer((host, port), _Handler)
+    srv.daemon_threads = True
     srv.db_path = db_path or DB_PATH
-    srv.conn = connect(srv.db_path)
     srv.timeout = 1
     while not (stop is not None and stop.is_set()):
         srv.handle_request()

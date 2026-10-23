@@ -1,6 +1,7 @@
 """Offline tests for the dashboard: settlement coverage, health, page rendering, pair detail API and the server."""
 import html
 import json
+import socket
 import threading
 import time
 import urllib.error
@@ -138,5 +139,24 @@ def test_server_serves_page_api_and_404(seeded, tmp_path, monkeypatch):
         with pytest.raises(urllib.error.HTTPError):
             urllib.request.urlopen("http://127.0.0.1:8799/nope", timeout=5)
     finally:
+        stop.set()
+        t.join(timeout=5)
+
+
+def test_idle_connection_does_not_block_the_page(tmp_path):
+    db = str(tmp_path / "t.db")
+    conn = connect(db)
+    _seed(conn, 1000 * H, short_rate=3e-5, long_rate=0.0)
+    conn.commit()
+    stop = threading.Event()
+    t = threading.Thread(target=serve, args=("127.0.0.1", 8798, stop, db), daemon=True)
+    t.start()
+    time.sleep(0.3)
+    idle = socket.create_connection(("127.0.0.1", 8798))  # a browser pre-connect that never sends a request
+    try:
+        body = urllib.request.urlopen("http://127.0.0.1:8798/", timeout=5).read().decode()
+        assert "Funding scanner" in body
+    finally:
+        idle.close()
         stop.set()
         t.join(timeout=5)
