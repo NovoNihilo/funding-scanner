@@ -59,14 +59,14 @@ def test_hourly_grid_gap_is_not_zero_filled():
 
 
 def test_termination_after_three_and_positive_resets():
-    run_start, neg, terms, _ = lifecycle(_p([1, 1, -1, -1, 1, -1, -1, -1]))
+    run_start, neg, terms, _, _ = lifecycle(_p([1, 1, -1, -1, 1, -1, -1, -1]))
     assert terms == [8 * H] and run_start is None
-    run_start, neg, terms, _ = lifecycle(_p([1, -1, -1, 1, -1, -1]))
+    run_start, neg, terms, _, _ = lifecycle(_p([1, -1, -1, 1, -1, -1]))
     assert terms == [] and neg == 2 and run_start == 0
 
 
 def test_missing_and_zero_handling():
-    run_start, neg, terms, _ = lifecycle(_p([1, -1, None, 0, -1]))
+    run_start, neg, terms, _, _ = lifecycle(_p([1, -1, None, 0, -1]))
     assert terms == [5 * H]  # None skipped (no reset), zero counts as non-profitable
 
 
@@ -223,23 +223,69 @@ def _var_pair(conn, now, var_rates, hl_rates):
 VPAIR = "AAA|hyperliquid:AAA>variational:AAA-PERP"
 
 
-def test_three_unprofitable_hours_kill_a_run_inside_one_variational_interval(monkeypatch):
-    monkeypatch.setattr(signals, "REQUIRED_VENUE", "variational")
+def _dip(hl_rate, hours):
+    """Qualified Var-short / HL-long pair (net +3e-5 per hour) whose last `hours` hours (ending now-1h) cost
+    the HL long `hl_rate` per hour."""
     conn = connect(":memory:")
     now = 1000 * H
     var = {now - k * 4 * H: 1.2e-4 for k in range(0, 15)}           # short Var receives 3e-5 per hour
     hl = {now - k * H: 0.0 for k in range(60)}
-    for k in (1, 2, 3):                                               # 3 hours where the HL long costs more
-        hl[now - k * H] = 5e-5
+    for k in range(1, hours + 1):
+        hl[now - k * H] = hl_rate
     _var_pair(conn, now, var, hl)
-    evaluate_all(conn, now - 4 * H)
-    assert conn.execute("SELECT status FROM signals WHERE pair_id=?", (VPAIR,)).fetchone()[0] == "QUALIFIED"
+    evaluate_all(conn, now - (hours + 1) * H)
+    assert _status(conn)["status"] == "QUALIFIED"
+    return conn, now
+
+
+def _status(conn):
+    return conn.execute("SELECT status, run_start, cohort, age_h FROM signals WHERE pair_id=?", (VPAIR,)).fetchone()
+
+
+def test_three_unprofitable_hours_kill_a_run_inside_one_variational_interval(monkeypatch):
+    monkeypatch.setattr(signals, "REQUIRED_VENUE", "variational")
+    conn, now = _dip(3e-4, 3)                                         # a real reversal: -2.7e-4 per hour
     evaluate_all(conn, now - H)                                       # hours -3, -2, -1 were all negative
-    row = conn.execute("SELECT status, run_start FROM signals WHERE pair_id=?", (VPAIR,)).fetchone()
+    row = _status(conn)
     assert row["status"] == "TERMINATED" and row["run_start"] is None
+    detail = conn.execute("SELECT detail FROM signal_events WHERE to_status='TERMINATED'").fetchone()[0]
+    assert detail == "killed: 3 unprofitable hours in a row lost 112% of the previous 24h's earnings"
     evaluate_all(conn, now)                                           # next positive hour starts a NEW run
-    row = conn.execute("SELECT status, cohort, age_h FROM signals WHERE pair_id=?", (VPAIR,)).fetchone()
+    row = _status(conn)
     assert (row["status"], row["cohort"], row["age_h"]) == ("MONITORING", "FRESH", 1.0)
+
+
+def test_small_dips_inside_a_healthy_run_are_tolerated(monkeypatch):
+    monkeypatch.setattr(signals, "REQUIRED_VENUE", "variational")
+    conn, now = _dip(4e-5, 3)                                         # -1e-5 per hour: 4% of the 24h cushion
+    run_start = _status(conn)["run_start"]
+    evaluate_all(conn, now - H)
+    row = _status(conn)
+    assert row["status"] == "QUALIFIED" and row["run_start"] == run_start
+
+
+def test_six_unprofitable_hours_kill_a_run_whatever_their_size(monkeypatch):
+    monkeypatch.setattr(signals, "REQUIRED_VENUE", "variational")
+    conn, now = _dip(4e-5, 6)
+    evaluate_all(conn, now - 2 * H)                                   # 5 small losing hours: still alive
+    assert _status(conn)["status"] == "QUALIFIED"
+    evaluate_all(conn, now - H)                                       # the 6th kills it
+    assert _status(conn)["status"] == "TERMINATED"
+    detail = conn.execute("SELECT detail FROM signal_events WHERE to_status='TERMINATED'").fetchone()[0]
+    assert detail == "killed: 6 unprofitable hours in a row"
+
+
+def test_lifecycle_measures_the_streak_against_the_prior_24h_only():
+    def per(t, net):
+        return {"end": t * H, "hours": 1.0, "net": net, "excluded": False}
+    early = [per(t, 1e-3) for t in range(1, 11)]                      # big early earnings, then 30 quiet hours
+    quiet = [per(t, 1e-6) for t in range(11, 41)]
+    dip = [per(t, -1e-5) for t in range(41, 44)]                      # small vs the run, large vs the last 24h
+    run_start, neg, terms, _, why = signals.lifecycle(early + quiet + dip)
+    assert run_start is None and terms == [43 * H] and "lost" in why[0]
+    soon = [per(t, -1e-5) for t in range(11, 14)]
+    run_start, neg, terms, _, why = signals.lifecycle(early + soon)    # same dip right after the big hours
+    assert run_start == 0 and neg == 3 and terms == []
 
 
 def test_emerging_between_8_and_24_hours(monkeypatch):

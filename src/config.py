@@ -25,7 +25,10 @@ APY_BASIS = os.environ.get("APY_BASIS", "capital")  # 'capital' (total collatera
 MAX_LEVERAGE_CAP = float(os.environ.get("MAX_LEVERAGE_CAP", "5"))
 
 # Signal lifecycle
-TERMINATE_AFTER = int(os.environ.get("TERMINATE_AFTER", "3"))  # consecutive non-positive HOURS kill a run
+TERMINATE_AFTER = int(os.environ.get("TERMINATE_AFTER", "3"))  # min consecutive non-positive HOURS to kill a run
+KILL_LOSS_SHARE = float(os.environ.get("KILL_LOSS_SHARE", "0.25"))  # ...if they lose > 25% of the cushion
+KILL_CUSHION_H = int(os.environ.get("KILL_CUSHION_H", "24"))  # cushion = run earnings in the 24h before the streak
+TERMINATE_HARD_AFTER = int(os.environ.get("TERMINATE_HARD_AFTER", "6"))  # this many in a row kill regardless
 EMERGING_MIN_H = float(os.environ.get("EMERGING_MIN_H", "8"))  # runs this old (and < 24h) can be EMERGING
 QUALIFY_MIN_H = float(os.environ.get("QUALIFY_MIN_H", "24"))  # runs this old can be QUALIFIED
 TREND_RECENT_H = int(os.environ.get("TREND_RECENT_H", "12"))  # trend: last 12h vs the 24h before it

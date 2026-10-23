@@ -31,7 +31,8 @@ hour, UTC), so a restart never lands on one.
    as it passes (estimated from the last snapshot before it; a late fallback of up to 1 hour is marked as such).
 3. **Signals** (`src/signals.py`): each pair becomes an hourly series. Every hour pairs the other venue's hourly rate
    with Variational's last recorded settlement, held until the next one. A run starts at the first profitable hour
-   and is killed after 3 unprofitable hours in a row.
+   and is killed when 3 or more unprofitable hours in a row lose more than 25% of what the run earned in the 24
+   hours before them, or after 6 unprofitable hours in a row whatever their size. Small dips are tolerated.
    - **Emerging**: run 8 to 24 hours old and passing the checks on the run so far.
    - **Qualified**: run 24 hours or older, conservative APY (lower of the 48h and 7-day averages) of at least 5% at
      1x on capital, profitable in at least 60% of hours, at least 90% data coverage, tradable markets.
@@ -63,7 +64,9 @@ All settings are environment variables with sensible defaults (`src/config.py`).
 | `REQUIRED_VENUE` | `variational` | every pair must have a leg here (empty = all pairs) |
 | `HIP3_DEXES` | `xyz` | trusted Hyperliquid builder dexes, comma-separated |
 | `MIN_APY_1X` | `0.05` | minimum APY at 1x on capital |
-| `TERMINATE_AFTER` | `3` | unprofitable hours in a row that kill a run |
+| `TERMINATE_AFTER` | `3` | minimum unprofitable hours in a row before a run can be killed |
+| `KILL_LOSS_SHARE` / `KILL_CUSHION_H` | `0.25` / `24` | ...when they lose this share of the run's earnings over the prior 24h |
+| `TERMINATE_HARD_AFTER` | `6` | unprofitable hours in a row that kill a run regardless of size |
 | `EMERGING_MIN_H` / `QUALIFY_MIN_H` | `8` / `24` | run age for Emerging / Qualified |
 | `MAX_LEVERAGE_CAP` | `5` | ceiling on the suggested leverage |
 | `PRIMARY_SIZE`, `COST_SIZES` | `1000`, `1000,5000` | USD per leg used for costs |

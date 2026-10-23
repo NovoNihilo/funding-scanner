@@ -12,13 +12,17 @@ from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from src.config import (APY_BASIS, DB_PATH, EMERGING_MIN_H, HOLD_HORIZON_H, MAX_LEVERAGE_CAP, MIN_APY_1X,
-                        PRIMARY_SIZE, REQUIRED_VENUE, SIGNAL_LOOKBACK_DAYS, TERMINATE_AFTER)
+from src.config import (APY_BASIS, DB_PATH, EMERGING_MIN_H, HOLD_HORIZON_H, KILL_CUSHION_H, KILL_LOSS_SHARE,
+                        MAX_LEVERAGE_CAP, MIN_APY_1X, PRIMARY_SIZE, REQUIRED_VENUE, SIGNAL_LOOKBACK_DAYS,
+                        TERMINATE_AFTER, TERMINATE_HARD_AFTER)
 from src.db import connect
 from src.funding import completeness, upcoming_settlements
 from src.signals import _load, _normal_interval, build_periods, lifecycle, mark_anomalies, var_hourly
 
 HOUR = 3600
+KILL_RULE = (f"A run is killed when {TERMINATE_AFTER} or more unprofitable hours in a row lose more than "
+             f"{KILL_LOSS_SHARE:.0%} of what it earned in the {KILL_CUSHION_H} hours before them, or after "
+             f"{TERMINATE_HARD_AFTER} in a row whatever their size.")
 VENUE = {"hyperliquid": ("HL", "Hyperliquid"), "lighter": ("LT", "Lighter"), "variational": ("VAR", "Variational")}
 STATUS = {"QUALIFIED": "Qualified", "EMERGING": "Emerging", "SUSPENDED": "Suspended", "MONITORING": "Monitoring",
           "TERMINATED": "Terminated"}
@@ -165,7 +169,7 @@ def pair_series(conn, row, hours=168, cache=None):
         normal = _normal_interval(vr) if vm["asset_class"] == "tradfi" else None
     periods = [p for p in build_periods(lr, sr, var_leg, normal) if p["end"] <= now]
     mark_anomalies(periods)
-    run_start, _, kills, _ = lifecycle(periods)
+    run_start, _, kills, _, _ = lifecycle(periods)
 
     def leg_rate(r, is_var, t):
         if is_var:
@@ -247,7 +251,7 @@ def pair_detail(conn, pair_id):
         "reasons": [humanize(r) for r in json.loads(row["reasons"] or "[]")],
         "leverage_note": leverage_note(row, lg, sh, m), "series": pts, "run_start": run_start, "kills": kills,
         "updated_at": row["updated_at"], "apy_factor": APY_FACTOR, "min_apy": MIN_APY_1X,
-        "terminate_after": TERMINATE_AFTER, "hold_h": HOLD_HORIZON_H,
+        "kill_rule": KILL_RULE, "hold_h": HOLD_HORIZON_H,
     }
 
 
@@ -462,7 +466,9 @@ def activity_tab(conn, live):
         to = e["to_status"]
         detail = "; ".join(humanize(x) for x in (e["detail"] or "").split("; ") if x)
         if to == "TERMINATED":
-            detail = f"Killed after {TERMINATE_AFTER} unprofitable hours in a row"
+            why = (e["detail"] or "").removeprefix("killed: ")
+            detail = "Killed: " + (f"{TERMINATE_AFTER} unprofitable hours in a row"
+                                   if why == "3 consecutive non-positive hours" else why)
         out.append(f'<tr data-pair="{esc(e["pair_id"])}"><td class="when">{ts_tag(e["ts"])}</td>'
                    f'<td><button class="open" data-pair="{esc(e["pair_id"])}">{esc(asset)}</button></td>'
                    f'<td><div class="trade"><span class="side">Long</span>{badge(lv)}<span class="sym">{esc(ls)}</span>'
@@ -734,7 +740,7 @@ function render(d){if(d.error){dbody.innerHTML='<p>'+esc(d.error)+'</p>';return}
  if(d.reasons.length&&d.status!=='QUALIFIED'&&d.status!=='EMERGING')h+='<div class="d-sec"><h3>Why it isn\\'t qualified</h3><ul class="flags">'+d.reasons.map(function(r){return '<li>'+esc(r)+'</li>'}).join('')+'</ul></div>';
  if(d.flags.length)h+='<div class="d-sec"><h3>Things to know</h3><ul class="flags">'+d.flags.map(function(f){return '<li>'+esc(f.text)+'<code>'+esc(f.code)+'</code></li>'}).join('')+'</ul></div>';
  h+='<p class="fine" style="margin-top:24px">Each hour pairs the Hyperliquid or Lighter hourly rate with the last recorded Variational settlement, held until the next one. '
-  +'A run is killed after '+d.terminate_after+' unprofitable hours in a row. Updated '+local(d.updated_at)+'.</p>';
+  +esc(d.kill_rule)+' Updated '+local(d.updated_at)+'.</p>';
  dbody.innerHTML=h;drawChart($('#chart'),d)}
 function costs(m){var rows='';['1000','5000'].forEach(function(s){var c=(m.costs||{})[s]||{};if(c.status!=='OK'){rows+='<span>$'+(+s).toLocaleString()+' per leg</span><span class="r muted">'+(c.status==='NO_DEPTH'?'book too thin':'not fetched yet')+'</span><span></span>';return}
  rows+='<span>$'+(+s).toLocaleString()+' per leg</span><span class="r">'+usd(c.cost_usd_maker)+' maker, '+hrs(c.payback_h_maker)+'</span><span class="r">'+usd(c.cost_usd)+' taker, '+hrs(c.payback_h)+'</span>'});

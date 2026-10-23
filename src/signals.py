@@ -6,9 +6,11 @@ For each matched asset and each (long venue, short venue) orientation with a leg
    the next settlement (never longer than its interval + 1h). Missing hours stay missing; nothing is zero-filled.
    hour net = short-leg hourly rate - long-leg hourly rate  (fraction of one leg's notional).
 2. Exclude dividend-window hours (Variational tradfi interval switch) and extreme outliers.
-3. Lifecycle: a run starts at the first positive hour and is killed after TERMINATE_AFTER consecutive
-   non-positive hours; the next positive hour starts a new run from zero. Missing/excluded hours neither
-   count nor reset.
+3. Lifecycle: a run starts at the first positive hour. A streak of non-positive hours kills it when the streak
+   is TERMINATE_AFTER+ hours long AND its combined loss exceeds KILL_LOSS_SHARE of what the run earned in the
+   KILL_CUSHION_H hours before the streak, or when the streak reaches TERMINATE_HARD_AFTER hours whatever its
+   size. Small dips inside a healthy run are tolerated. The next positive hour after a kill starts a new run
+   from zero. Missing/excluded hours neither count nor reset.
 4. Status: MONITORING -> EMERGING (run 8-24h old, passing the gates on the run so far) -> QUALIFIED (run 24h+,
    conservative funding = min(48h, 7d) average, plus consistency and coverage gates) -> SUSPENDED if a qualified
    run later fails a gate; TERMINATED when the run is killed. Gates judge the FUNDING signal only.
@@ -25,9 +27,11 @@ from itertools import permutations
 from statistics import median
 
 from src.config import (ANOMALY_MAD_K, ANOMALY_MIN_HOURLY, APY_BASIS, COST_MAX_AGE_S, COST_SIZES, EMERGING_MIN_H,
-                        HOLD_HORIZON_H, MAX_LEVERAGE_CAP, MIN_APY_1X, MIN_COVERAGE, MIN_POSITIVE_SHARE,
+                        HOLD_HORIZON_H, KILL_CUSHION_H, KILL_LOSS_SHARE, MAX_LEVERAGE_CAP, MIN_APY_1X,
+                        MIN_COVERAGE, MIN_POSITIVE_SHARE,
                         PAYBACK_FAST_H, PAYBACK_OK_H, PRIMARY_SIZE, QUALIFY_MIN_H, REQUIRED_VENUE,
-                        SIGNAL_LOOKBACK_DAYS, TERMINATE_AFTER, TREND_APY_DELTA, TREND_PRIOR_H, TREND_RECENT_H)
+                        SIGNAL_LOOKBACK_DAYS, TERMINATE_AFTER, TERMINATE_HARD_AFTER, TREND_APY_DELTA,
+                        TREND_PRIOR_H, TREND_RECENT_H)
 from src.costs import stress_leverage
 
 HOUR = 3600
@@ -129,24 +133,43 @@ def window_stats(periods, now, hours):
 
 
 def lifecycle(periods):
-    """Return (run_start, neg_streak, terminations, longest_neg_hours)."""
-    run_start, neg, neg_h, longest, terms = None, 0, 0.0, 0.0, []
+    """Return (run_start, neg_streak, terminations, longest_neg_hours, kill_reasons).
+    A non-positive streak kills the run when it is TERMINATE_AFTER+ hours long and has lost more than
+    KILL_LOSS_SHARE of the run's earnings in the KILL_CUSHION_H hours before the streak (the cushion), or when it
+    reaches TERMINATE_HARD_AFTER hours. A run with no cushion is killed by any TERMINATE_AFTER-hour streak."""
+    run_start, neg, neg_h, longest, terms, why = None, 0, 0.0, 0.0, [], []
+    hist, loss, cushion = [], 0.0, 0.0  # hist: (end, net) of the current run's valid hours
     for p in periods:
         if p["net"] is None or p["excluded"]:
             continue
         if p["net"] > 0:
-            neg, neg_h = 0, 0.0
+            neg, neg_h, loss = 0, 0.0, 0.0
             if run_start is None:
-                run_start = int(p["end"] - p["hours"] * HOUR)
-        else:
-            neg_h += p["hours"]
-            longest = max(longest, neg_h)
-            if run_start is not None:
-                neg += 1
-                if neg >= TERMINATE_AFTER:
-                    terms.append(p["end"])
-                    run_start, neg = None, 0
-    return run_start, neg, terms, longest
+                run_start, hist = int(p["end"] - p["hours"] * HOUR), []
+            hist.append((p["end"], p["net"]))
+            continue
+        neg_h += p["hours"]
+        longest = max(longest, neg_h)
+        if run_start is None:
+            continue
+        if neg == 0:
+            lo = p["end"] - p["hours"] * HOUR - KILL_CUSHION_H * HOUR
+            cushion = max(0.0, sum(n for e, n in hist if e > lo))
+        neg += 1
+        loss -= p["net"]
+        hist.append((p["end"], p["net"]))
+        reason = None
+        if neg >= TERMINATE_HARD_AFTER:
+            reason = f"{neg} unprofitable hours in a row"
+        elif neg >= TERMINATE_AFTER and loss > KILL_LOSS_SHARE * cushion:
+            reason = (f"{neg} unprofitable hours in a row lost {loss / cushion:.0%} of the previous "
+                      f"{KILL_CUSHION_H}h's earnings" if cushion > 0 else
+                      f"{neg} unprofitable hours in a row with no earnings before them")
+        if reason:
+            terms.append(p["end"])
+            why.append(reason)
+            run_start, neg, loss, hist = None, 0, 0.0, []
+    return run_start, neg, terms, longest, why
 
 
 def cohort_for(age_h):
@@ -278,7 +301,7 @@ def evaluate_pair(lg, sh, long_r, short_r, now, lg_costs=None, sh_costs=None, p9
         flags.add("STRESS_DEFAULT")
     spread_apr, apy_1x, apy_max = apy_numbers(shown, max_lev) if shown is not None else (None,) * 3
 
-    run_start, neg, terms, longest_neg = lifecycle(periods)
+    run_start, neg, terms, longest_neg, kill_why = lifecycle(periods)
     complete = [p for p in periods if p["net"] is not None]
     last_end = complete[-1]["end"] if complete else None
     age_h = (now - run_start) / HOUR if run_start is not None else 0.0
@@ -332,7 +355,8 @@ def evaluate_pair(lg, sh, long_r, short_r, now, lg_costs=None, sh_costs=None, p9
         "coverage_24h": w24["coverage"], "coverage_7d": w7["coverage"],
         "history_hours": w7["valid_hours"], "history_needed_hours": 24,
         "longest_neg_hours": longest_neg, "terminations": len(terms),
-        "last_termination": terms[-1] if terms else None, "last_period_end": last_end,
+        "last_termination": terms[-1] if terms else None,
+        "last_kill_reason": kill_why[-1] if kill_why else None, "last_period_end": last_end,
         "stress_move": stress_move, "stress_lev": stress_lev,
         "costs": {str(int(k)): v for k, v in costs.items()},
         "rank_net_hold_usd": primary.get("net_hold_usd"),
@@ -425,7 +449,7 @@ def evaluate_all(conn, now=None, persist=True):
             if status != old_status:
                 detail = "; ".join(sig["reasons"]) if status in ("SUSPENDED", "MONITORING") else ""
                 if status == "TERMINATED":
-                    detail = f"killed: {TERMINATE_AFTER} consecutive non-positive hours"
+                    detail = f"killed: {sig['metrics']['last_kill_reason'] or 'unprofitable hours'}"
                 events.append((pair_id, now, "STATUS", old_status, status, detail))
             elif status == "QUALIFIED" and prev and cohort != prev["cohort"]:
                 events.append((pair_id, now, "COHORT", prev["cohort"], cohort, ""))
