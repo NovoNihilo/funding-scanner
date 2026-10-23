@@ -1,7 +1,8 @@
 """Read-only dashboard, rendered from the database on every request.
 Served on localhost only (DASHBOARD_HOST); open it through the SSH tunnel: deploy/dashboard.ps1.
-Routes:  /                 the page (tabs: Opportunities, Watchlist, Health, Activity)
-         /api/pair?id=...  JSON for one pair's detail panel (hourly series, legs, costs, flags explained)"""
+Routes:  /                 the page (tabs: Opportunities, Watchlist, Markets, Health, Activity)
+         /api/pair?id=...  JSON for one pair's detail panel (hourly series, legs, costs, flags explained)
+         /api/asset?a=...  JSON for one asset's funding on every venue (Markets tab)"""
 import html
 import json
 import os
@@ -17,6 +18,7 @@ from src.config import (APY_BASIS, DB_PATH, EMERGING_MIN_H, HOLD_HORIZON_H, KILL
                         TERMINATE_AFTER, TERMINATE_HARD_AFTER)
 from src.db import connect
 from src.funding import completeness, upcoming_settlements
+from src.markets import asset_detail, overview
 from src.signals import _load, _normal_interval, build_periods, lifecycle, mark_anomalies, var_hourly
 
 HOUR = 3600
@@ -481,6 +483,49 @@ def activity_tab(conn, live):
             f'<tbody>{"".join(out)}</tbody></table></div>')
 
 
+def apr(h):
+    return "n/a" if h is None else f"{h * 8760 * 100:+.1f}%"
+
+
+def market_cell(ms):
+    if not ms:
+        return '<td class="n muted" data-v="-1e18">&#8211;</td>'
+    parts = []
+    for m in ms:
+        tag = f'<span class="tag">{esc(m["symbol"].split(":")[0])}</span>' if m["key"] == "hip3" else ""
+        parts.append(f'<div class="mv"><b>{apr(m["avg24"])}</b>{tag}<span class="sub">last hour {apr(m["now"])}</span></div>')
+    return f'<td class="n" data-v="{num(ms[0]["avg24"])}">{"".join(parts)}</td>'
+
+
+def markets_tab(rows):
+    if not rows:
+        return '<p class="empty">No tracked assets yet.</p>'
+    out = []
+    for r in rows:
+        cells = "".join(market_cell([m for m in r["markets"] if m["venue"] == v])
+                        for v in ("variational", "hyperliquid", "lighter"))
+        b = r["best"]
+        if b:
+            side = f'Short VAR, long {esc(b["other"])}' if b["short_var"] else f'Long VAR, short {esc(b["other"])}'
+            sp = f'<td class="n" data-v="{b["apy"]}"><b>{pct(b["apy"])}</b><span class="sub">{side}</span></td>'
+        else:
+            sp = '<td class="n muted" data-v="-1e18">Not enough data</td>'
+        ivl = r["var_interval_s"]
+        text = " ".join([r["asset"]] + [m["symbol"] for m in r["markets"]]).lower()
+        out.append(f'<tr data-asset="{esc(r["asset"])}" data-class="{esc(r["class"])}" data-text="{esc(text)}">'
+                   f'<td class="c-asset" data-v="{esc(r["asset"])}"><button class="open" data-asset="{esc(r["asset"])}">'
+                   f'{esc(r["asset"])}</button><span class="sub">{"RWA" if r["class"] == "tradfi" else "Crypto"}</span></td>'
+                   f'{cells}{sp}<td class="n" data-v="{ivl or 0}">{f"{ivl // 3600}h" if ivl else "n/a"}</td></tr>')
+    heads = [("Asset", "c-asset"), ("Variational", "n"), ("Hyperliquid", "n"), ("Lighter", "n"),
+             ("Widest spread, 24h", "n"), ("Variational settles", "n")]
+    th = "".join(f'<th class="{c}" scope="col"><button class="sort" data-col="{i}">{h}</button></th>'
+                 for i, (h, c) in enumerate(heads))
+    return ('<section id="asset-detail" class="asset" aria-live="polite"><p class="muted">Pick an asset below to see '
+            'its funding history on every venue.</p></section>'
+            f'<div class="tablewrap"><table class="pairs mkts"><thead><tr>{th}</tr></thead>'
+            f'<tbody>{"".join(out)}</tbody></table></div>')
+
+
 def build_page(conn, now=None, db_path=None):
     now = int(now or time.time())
     sigs = conn.execute("SELECT * FROM signals").fetchall()
@@ -523,8 +568,9 @@ def build_page(conn, now=None, db_path=None):
     wl = (f'<div class="sechead"><h2>Watchlist</h2><p>The {len(watch)} highest-APY profitable-direction pairs that '
           f'aren\'t qualified or emerging yet, with what is holding each one back.</p></div>'
           + pair_table(watch, classes, series, "No other pairs have an APY yet.", with_reasons=True))
+    mk = overview(conn, now)
     tabs = [("opportunities", "Opportunities", len(qualified) + len(emerging)), ("watchlist", "Watchlist", len(watch)),
-            ("health", "Health", None), ("activity", "Activity", None)]
+            ("markets", "Markets", len(mk)), ("health", "Health", None), ("activity", "Activity", None)]
     tablist = "".join(f'<button role="tab" id="t-{k}" aria-controls="tab-{k}" data-tab="{k}" aria-selected="false">'
                       f'{label}{f" <span class=count>{n}</span>" if n is not None else ""}</button>'
                       for k, label, n in tabs)
@@ -545,6 +591,9 @@ def build_page(conn, now=None, db_path=None):
 <main>
   <div role="tabpanel" id="tab-opportunities" aria-labelledby="t-opportunities">{opp}</div>
   <div role="tabpanel" id="tab-watchlist" aria-labelledby="t-watchlist" hidden>{wl}</div>
+  <div role="tabpanel" id="tab-markets" aria-labelledby="t-markets" hidden><div class="sechead"><h2>Markets</h2>
+    <p>Funding on every tracked asset, venue by venue. Rates are the 24h average APR on position notional (above zero,
+    longs pay shorts). The spread is the widest gap against Variational, as APY at 1x on capital.</p></div>{markets_tab(mk)}</div>
   <div role="tabpanel" id="tab-health" aria-labelledby="t-health" hidden><div class="sechead"><h2>Health</h2>
     <p>Whether every collector is running and the data is complete.</p></div>{health_tab(h, warming)}</div>
   <div role="tabpanel" id="tab-activity" aria-labelledby="t-activity" hidden><div class="sechead"><h2>Activity</h2>
@@ -564,10 +613,11 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <style>
 :root{--paper:#f3f5f8;--surface:#fff;--ink:#161a21;--ink2:#4b5563;--muted:#6b7380;--rule:#e3e7ec;--rule2:#eef1f4;
 --pos:#2a78d6;--neg:#e34948;--ex:#b8bfc9;--good:#0e8a0e;--warn:#a86a00;--fail:#c8322f;--focus:#2a78d6;
---goodbg:#e6f4e6;--warnbg:#fbf1dc;--failbg:#fbe7e6;--chip:#eef1f4}
+--goodbg:#e6f4e6;--warnbg:#fbf1dc;--failbg:#fbe7e6;--chip:#eef1f4;--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100}
 @media (prefers-color-scheme:dark){:root{--paper:#141920;--surface:#1b212b;--ink:#e9edf2;--ink2:#b4bcc8;--muted:#8a93a1;
 --rule:#2a313d;--rule2:#232a35;--pos:#3987e5;--neg:#e66767;--ex:#4a5260;--good:#4cc76a;--warn:#e7b04a;--fail:#ff7a6b;
---focus:#3987e5;--goodbg:#173022;--warnbg:#2f2614;--failbg:#351b1c;--chip:#262d39}}
+--focus:#3987e5;--goodbg:#173022;--warnbg:#2f2614;--failbg:#351b1c;--chip:#262d39;--s1:#3987e5;--s2:#d95926;
+--s3:#199e70;--s4:#c98500}}
 *{box-sizing:border-box}
 html{background:var(--paper)}
 body{margin:0;color:var(--ink);font:15px/1.5 "IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
@@ -676,6 +726,54 @@ tbody tr[data-pair]{cursor:pointer}tbody tr[data-pair]:hover{background:var(--ru
 .flags code{font:500 12px "IBM Plex Sans Condensed",sans-serif;color:var(--muted);display:block}
 details.tbl summary{cursor:pointer;color:var(--ink2);font-size:13px;margin-top:8px}
 details.tbl table{font-size:13px}details.tbl td,details.tbl th{padding:5px 8px}
+.asset{background:var(--surface);border:1px solid var(--rule);border-radius:10px;padding:18px 20px 22px;margin-bottom:20px;
+ transition:opacity .15s;scroll-margin-top:70px}
+.asset.is-loading{opacity:.5}.asset>p{margin:0}
+.a-head{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;margin-bottom:16px}
+.a-head h3{margin:0 0 2px;font:600 26px/1.1 "IBM Plex Sans Condensed","IBM Plex Sans",sans-serif}
+.a-head .muted{font-size:13px}
+.seg{display:inline-flex;border:1px solid var(--rule);border-radius:8px;overflow:hidden}
+.seg button{background:none;border:0;padding:6px 13px;cursor:pointer;color:var(--ink2);font-size:13px;font-weight:500}
+.seg button+button{border-left:1px solid var(--rule)}
+.seg button[aria-pressed=true]{background:var(--ink);color:var(--surface)}
+.vcards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
+.vcard{border:1px solid var(--rule);border-radius:10px;padding:12px 14px}
+.vcard>b{display:block;font-size:22px;font-weight:600;margin-top:8px}
+.vc-name{display:flex;align-items:center;gap:8px;font-weight:500;font-size:14px;flex-wrap:wrap}
+.vc-name .muted{font-size:12.5px;font-weight:400}
+.vcard dl{display:grid;grid-template-columns:1fr auto;gap:4px 10px;margin:10px 0 0;font-size:13px}
+.vcard dt{color:var(--muted)}.vcard dd{margin:0;text-align:right}
+.key{display:inline-block;width:14px;height:3px;border-radius:2px;flex:none}
+.key.s1{background:var(--s1)}.key.s2{background:var(--s2)}.key.s3{background:var(--s3)}.key.s4{background:var(--s4)}
+.a-chart{margin-top:22px}
+.a-ct{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 12px;margin-bottom:8px}
+.a-ct h4{margin:0;font:600 15px/1.3 "IBM Plex Sans Condensed","IBM Plex Sans",sans-serif}.a-ct span{font-size:13px}
+.lg-toggle{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+.lg-toggle button{display:inline-flex;align-items:center;gap:7px;background:none;border:1px solid var(--rule);border-radius:999px;
+ padding:3px 11px;cursor:pointer;font-size:12.5px;color:var(--ink2)}
+.lg-toggle button[aria-pressed=false]{opacity:.45;text-decoration:line-through}
+.chart .ln{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.chart .ln.s1{stroke:var(--s1)}.chart .ln.s2{stroke:var(--s2)}.chart .ln.s3{stroke:var(--s3)}.chart .ln.s4{stroke:var(--s4)}
+.chart .pt.s1{fill:var(--s1)}.chart .pt.s2{fill:var(--s2)}.chart .pt.s3{fill:var(--s3)}.chart .pt.s4{fill:var(--s4)}
+.chart .dl{fill:var(--ink2);font:12px "IBM Plex Sans",sans-serif}
+.chart .tick{stroke:var(--rule)}.chart .guide{stroke:var(--ink2);stroke-dasharray:4 4;stroke-opacity:.6}
+.chart svg:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.mtip{position:absolute;top:4px;pointer-events:none;background:var(--ink);color:var(--surface);font-size:12.5px;padding:8px 10px;
+ border-radius:8px;white-space:nowrap;z-index:2}
+.mtip .tt{opacity:.75;margin-bottom:4px}.mtip .row{display:flex;align-items:center;gap:8px;line-height:1.6}
+.mtip .row span{opacity:.8}.mtip .key{width:12px}
+.clip-note{margin:4px 0 0;color:var(--muted);font-size:12.5px}
+.sp-stats{display:flex;flex-wrap:wrap;gap:8px 22px;margin-top:8px;font-size:13px}
+.sp-stats div{display:flex;align-items:center;gap:7px}.sp-stats b{font-weight:600}
+.plist{display:flex;flex-wrap:wrap;gap:8px}
+.plist button{display:inline-flex;align-items:center;gap:10px;background:var(--surface);border:1px solid var(--rule);
+ border-radius:8px;padding:7px 11px;cursor:pointer;font-size:13.5px}
+.plist button:hover{background:var(--rule2)}
+.mkts .mv+.mv{margin-top:6px}.mkts td.n b{font-weight:600}
+.tag{font:600 10.5px/1 "IBM Plex Sans Condensed",sans-serif;padding:2px 4px;border-radius:3px;background:var(--chip);
+ color:var(--ink2);margin-left:5px;vertical-align:1px}
+tr.is-sel td{background:var(--rule2)}tr.is-sel td:first-child{box-shadow:inset 3px 0 0 var(--ink)}
+@media (max-width:820px){.asset{padding:14px 12px 16px}.mkts th:nth-child(6),.mkts td:nth-child(6){display:none}}
 @media (max-width:820px){.top,.bar,main{padding-left:16px;padding-right:16px}.filters{width:100%}input{flex:1;width:auto}
  .c-trend,.c-net,.c-age,.c-spark{display:none}.d-figs{grid-template-columns:repeat(2,1fr)}.drawer-body{padding:20px 16px 40px}}
 @media (prefers-reduced-motion:reduce){.drawer{transition:none}}
@@ -688,8 +786,9 @@ function local(ts,opt){return new Date(ts*1000).toLocaleString([],opt||{month:'s
 $$('time[data-ts]').forEach(function(t){t.title=t.textContent;t.textContent=local(+t.dataset.ts)});
 function store(k,v){try{if(v===undefined)return sessionStorage.getItem(k);sessionStorage.setItem(k,v)}catch(e){return null}}
 // tabs
-function show(id){if(!$('#tab-'+id))id='opportunities';$$('[role=tab]').forEach(function(t){t.setAttribute('aria-selected',t.dataset.tab===id)});
- $$('[role=tabpanel]').forEach(function(p){p.hidden=p.id!=='tab-'+id});if(location.hash!=='#'+id)history.replaceState(null,'','#'+id)}
+function show(id){var sub=String(id||'').split('/');id=sub[0];if(!$('#tab-'+id))id='opportunities';$$('[role=tab]').forEach(function(t){t.setAttribute('aria-selected',t.dataset.tab===id)});
+ $$('[role=tabpanel]').forEach(function(p){p.hidden=p.id!=='tab-'+id});if(location.hash.split('/')[0]!=='#'+id)history.replaceState(null,'','#'+id);
+ if(id==='markets'){var a=null;try{a=sub[1]?decodeURIComponent(sub[1]):null}catch(e){}setTimeout(function(){openAsset(a)},0)}}
 $$('[role=tab]').forEach(function(t){t.onclick=function(){show(t.dataset.tab)}});
 $$('[data-goto]').forEach(function(b){b.onclick=function(){show(b.dataset.goto)}});
 $('[role=tablist]').addEventListener('keydown',function(e){var tabs=$$('[role=tab]'),i=tabs.indexOf(document.activeElement);
@@ -775,6 +874,104 @@ function drawChart(el,d){var s=d.series;if(!s.length){el.innerHTML='<p class="mu
   tip.hidden=false;tip.style.left=(cx*r.width/W)+'px';tip.style.top=(Math.min(y(p.net==null?0:p.net*f),z)*r.height/H)+'px'}
  function leave(){tip.hidden=true;cross.setAttribute('visibility','hidden')}
  svg.addEventListener('mousemove',move);svg.addEventListener('mouseleave',leave)}
+// markets tab: one asset's funding on every venue
+var MK={asset:null,data:null,range:+(store('mk_range')||168),hidden:{}};
+if([24,72,168,336].indexOf(MK.range)<0)MK.range=168;
+var MSTATUS={QUALIFIED:'Qualified',EMERGING:'Emerging',SUSPENDED:'Suspended',MONITORING:'Monitoring',TERMINATED:'Terminated'};
+function rateTxt(v,dec){return v==null?'n/a':(v>=0?'+':'')+(v*100).toFixed(dec==null?1:dec)+'%'}
+function untilTxt(ts){var s=ts-Date.now()/1000;if(s<=0)return 'due now';var h=Math.floor(s/3600),m=Math.floor(s%3600/60);return 'in '+(h?h+'h ':'')+m+'m'}
+function niceStep(x){var p=Math.pow(10,Math.floor(Math.log10(x))),m=x/p;return (m<1.5?1:m<3?2:m<7?5:10)*p}
+function sid(s){return s.key+'|'+s.symbol}
+function openAsset(a){var box=$('#asset-detail');if(!box)return;if(!a)a=MK.asset;
+ if(!a){var first=$$('#tab-markets tbody tr[data-asset]').filter(function(r){return !r.hidden})[0];if(!first)return;a=first.dataset.asset}
+ if(location.hash.split('/')[0]==='#markets')history.replaceState(null,'','#markets/'+encodeURIComponent(a));
+ $$('#tab-markets tbody tr[data-asset]').forEach(function(r){r.classList.toggle('is-sel',r.dataset.asset===a)});
+ if(MK.asset===a&&MK.data&&MK.data.asset===a)return;
+ MK.asset=a;box.classList.add('is-loading');
+ fetch('/api/asset?a='+encodeURIComponent(a)).then(function(r){return r.json()}).then(function(d){if(MK.asset!==a)return;box.classList.remove('is-loading');
+  if(d.error){MK.data=null;box.innerHTML='<p class="muted">'+esc(d.error)+'</p>';return}MK.data=d;MK.hidden={};renderAsset()})
+ .catch(function(){box.classList.remove('is-loading');box.innerHTML='<p class="muted">Could not load this asset. Refresh the page and try again.</p>'})}
+function vcard(s,f){var st=s.stats,x=function(v){return v==null?null:v*f};
+ return '<div class="vcard"><div class="vc-name"><i class="key s'+s.slot+'"></i>'+esc(s.label)+'<span class="muted">'+esc(s.symbol)+'</span></div>'
+  +'<b>'+rateTxt(x(st.avg24))+'</b><span class="sub">24h average APR</span><dl>'
+  +'<dt>Last hour</dt><dd>'+rateTxt(x(st.now))+'</dd><dt>7-day average</dt><dd>'+rateTxt(x(st.avg7d))+'</dd>'
+  +'<dt>Longs paid shorts, 7d</dt><dd>'+(st.pos_share_7d==null?'n/a':pct(st.pos_share_7d,0)+' of hours')+'</dd>'
+  +(st.live!=null?'<dt>Showing now</dt><dd>'+rateTxt(x(st.live))+'</dd>':'')
+  +(st.next_ts?'<dt>Next settlement</dt><dd>'+untilTxt(st.next_ts)+'</dd>':'')
+  +'<dt>Settles every</dt><dd>'+(s.interval_s?Math.round(s.interval_s/3600)+'h':'n/a')+'</dd>'
+  +(s.max_lev?'<dt>Max leverage</dt><dd>'+Math.round(s.max_lev)+'x</dd>':'')+'</dl></div>'}
+function assetTable(d,lo,hi){var f=d.apr_factor,n=Math.min(48,Math.round((hi-lo)/3600)),rows='';
+ var maps=d.series.map(function(s){var m={};s.points.forEach(function(p){m[p[0]]=p[1]});return m});
+ for(var t=hi;t>hi-n*3600;t-=3600){rows+='<tr><td>'+local(t)+'</td>'+maps.map(function(m){return '<td class="n">'+(m[t]==null?'-':rateTxt(m[t]*f,2))+'</td>'}).join('')+'</tr>'}
+ return '<details class="tbl"><summary>Show the last '+n+' hours as a table</summary><div class="tablewrap"><table><thead><tr><th>Hour</th>'
+  +d.series.map(function(s){return '<th class="n">'+esc(s.label)+'</th>'}).join('')+'</tr></thead><tbody>'+rows+'</tbody></table></div></details>'}
+function assetPairs(d){if(!d.pairs.length)return '';
+ return '<div class="a-chart"><div class="a-ct"><h4>Pairs on this asset</h4><span class="muted">Open one for its run, costs and leverage.</span></div><div class="plist">'
+  +d.pairs.map(function(p){return '<button type="button" data-pair="'+esc(p.pair_id)+'"><span>Long '+esc(p.long)+', short '+esc(p.short)+'</span><b>'+(p.apy_1x==null?'n/a':pct(p.apy_1x))+'</b>'
+   +'<span class="chip '+(STATUSCLS[p.status]||'')+'">'+esc(MSTATUS[p.status]||p.status)+'</span></button>'}).join('')+'</div></div>'}
+function renderAsset(){var d=MK.data,box=$('#asset-detail');if(!d||!box)return;var hi=d.now,lo=hi-MK.range*3600;
+ var h='<div class="a-head"><div><h3>'+esc(d.asset)+'</h3><span class="muted">'+(d.class==='tradfi'?'RWA':'Crypto')+', '+d.series.length+' markets tracked</span></div>'
+  +'<div class="seg" role="group" aria-label="Time range">'+[[24,'1D'],[72,'3D'],[168,'7D'],[336,'14D']].map(function(r){return '<button type="button" data-range="'+r[0]+'" aria-pressed="'+(MK.range===r[0])+'">'+r[1]+'</button>'}).join('')+'</div></div>';
+ h+='<div class="vcards">'+d.series.map(function(s){return vcard(s,d.apr_factor)}).join('')+'</div>';
+ h+='<div class="a-chart"><div class="a-ct"><h4>Funding rate</h4><span class="muted">APR on position notional, hour by hour. Above zero, longs pay shorts. Variational holds each settlement until the next.</span></div>'
+  +'<div class="lg-toggle" role="group" aria-label="Show or hide venues">'+d.series.map(function(s){return '<button type="button" data-series="'+esc(sid(s))+'" aria-pressed="'+!MK.hidden[sid(s)]+'"><i class="key s'+s.slot+'"></i>'+esc(s.label)+'</button>'}).join('')+'</div>'
+  +'<div class="chart" id="mk-rates"></div></div>';
+ if(d.spreads.length)h+='<div class="a-chart"><div class="a-ct"><h4>Spread against Variational</h4><span class="muted">APY at 1x on capital. Above zero, short Variational and long the other venue earns; below zero, the reverse. Dashed lines mark the '+pct(d.min_apy,0)+' minimum.</span></div>'
+  +'<div class="chart" id="mk-spread"></div><div class="sp-stats">'+d.spreads.map(function(s){var st=s.stats,x=function(v){return v==null?null:v*d.apy_factor};
+   return '<div><i class="key s'+s.slot+'"></i><span>'+esc(s.label)+'</span><b>'+rateTxt(x(st.avg24))+'</b><span class="muted">24h average, '+rateTxt(x(st.avg7d))+' over 7 days</span></div>'}).join('')+'</div></div>';
+ h+=assetTable(d,lo,hi)+assetPairs(d);
+ box.innerHTML=h;
+ lineChart($('#mk-rates'),d.series,{lo:lo,hi:hi,f:d.apr_factor,label:'Hourly funding rate of '+d.asset+' on each venue, as APR'});
+ if(d.spreads.length)lineChart($('#mk-spread'),d.spreads,{lo:lo,hi:hi,f:d.apy_factor,guides:[d.min_apy,-d.min_apy],label:'Spread of '+d.asset+' against Variational, as APY at 1x'})}
+function lineChart(el,series,o){if(!el)return;var W=Math.max(300,Math.round(el.clientWidth||880)),H=W<600?220:260,L=52,R=W<600?58:84,T=12,B=28,lo=o.lo,hi=o.hi,f=o.f;
+ var vis=series.filter(function(s){return !MK.hidden[sid(s)]});
+ var maps=vis.map(function(s){var m={};s.points.forEach(function(p){if(p[0]>lo&&p[0]<=hi)m[p[0]]=p[1]*f});return m});
+ var vals=[];maps.forEach(function(m){for(var k in m)vals.push(m[k])});
+ if(!vals.length){el.innerHTML='<p class="muted">No data in this range'+(vis.length<series.length?' for the venues shown':'')+'.</p>';return}
+ vals.sort(function(a,b){return a-b});
+ var q=function(p){return vals[Math.floor(p*(vals.length-1))]},q1=q(.01),q9=q(.99),rs=(q9-q1)||1e-9;
+ var ymin=Math.min(vals[0]>=q1-rs/2?vals[0]:q1,0),ymax=Math.max(vals[vals.length-1]<=q9+rs/2?vals[vals.length-1]:q9,0);
+ (o.guides||[]).forEach(function(gv){ymin=Math.min(ymin,gv);ymax=Math.max(ymax,gv)});
+ var pad=(ymax-ymin||.01)*.08;ymin-=pad;ymax+=pad;
+ var clipped=vals[0]<ymin||vals[vals.length-1]>ymax;
+ var X=function(t){return L+(W-L-R)*(t-lo)/(hi-lo)},Y=function(v){v=Math.max(ymin,Math.min(ymax,v));return T+(H-T-B)*(ymax-v)/(ymax-ymin)};
+ var step=niceStep((ymax-ymin)/5),dec=step*100>=1?0:(step*100>=.1?1:2),g='';
+ for(var v=Math.ceil(ymin/step)*step;v<=ymax+1e-12;v+=step){var yy=Y(v);g+='<line class="grid" x1="'+L+'" x2="'+(W-R)+'" y1="'+yy+'" y2="'+yy+'"/><text class="axis" x="'+(L-8)+'" y="'+(yy+4)+'" text-anchor="end">'+(Math.abs(v)<step/2?'0%':rateTxt(v,dec))+'</text>'}
+ var span=hi-lo,every=span<=86400?6:(span<=3*86400?12:24),xt='';
+ var lastX=-1e9;for(var t=Math.ceil(lo/3600)*3600;t<=hi;t+=3600){var dt=new Date(t*1000),hr=dt.getHours();if(hr%every)continue;var x=X(t);if(x<L+16||x>W-R-16||x-lastX<64)continue;lastX=x;
+  xt+='<line class="tick" x1="'+x+'" x2="'+x+'" y1="'+(H-B)+'" y2="'+(H-B+4)+'"/><text class="axis" x="'+x+'" y="'+(H-8)+'" text-anchor="middle">'
+   +(hr===0?dt.toLocaleDateString([],{month:'short',day:'numeric'}):dt.toLocaleTimeString([],{hour:'numeric'}))+'</text>'}
+ var gl='';(o.guides||[]).forEach(function(gv){var yy=Y(gv);gl+='<line class="guide" x1="'+L+'" x2="'+(W-R)+'" y1="'+yy+'" y2="'+yy+'"/>'});
+ var zero=(ymin<0&&ymax>0)?'<line class="zero" x1="'+L+'" x2="'+(W-R)+'" y1="'+Y(0)+'" y2="'+Y(0)+'"/>':'';
+ var paths='',ends=[];
+ vis.forEach(function(s,i){var m=maps[i],ts=Object.keys(m).map(Number).sort(function(a,b){return a-b}),dd='',dots='',prev=null;
+  ts.forEach(function(t,j){var join=prev!=null&&t-prev<=3600;dd+=(join?'L':'M')+X(t).toFixed(1)+' '+Y(m[t]).toFixed(1);
+   if(!join&&!(ts[j+1]-t<=3600))dots+='<circle class="pt s'+s.slot+'" cx="'+X(t).toFixed(1)+'" cy="'+Y(m[t]).toFixed(1)+'" r="2.5"/>';prev=t});
+  paths+='<path class="ln s'+s.slot+'" d="'+dd+'"/>'+dots;
+  if(ts.length){var last=ts[ts.length-1];ends.push({y:Y(m[last]),txt:s.short,slot:s.slot})}});
+ ends.sort(function(a,b){return a.y-b.y});for(var k=1;k<ends.length;k++)if(ends[k].y-ends[k-1].y<14)ends[k].y=ends[k-1].y+14;
+ var over=ends.length?ends[ends.length-1].y-(H-B):0;if(over>0)ends.forEach(function(e){e.y-=over});
+ var labels=ends.map(function(e){return '<line class="ln s'+e.slot+'" x1="'+(W-R+6)+'" x2="'+(W-R+16)+'" y1="'+e.y+'" y2="'+e.y+'"/><text class="dl" x="'+(W-R+20)+'" y="'+(e.y+4)+'">'+esc(e.txt)+'</text>'}).join('');
+ el.innerHTML='<svg viewBox="0 0 '+W+' '+H+'" role="img" tabindex="0" aria-label="'+esc(o.label||'Chart')+'">'+g+gl+zero+paths+labels+xt
+  +'<line class="cross" x1="0" x2="0" y1="'+T+'" y2="'+(H-B)+'" visibility="hidden"/><rect class="hit" x="'+L+'" y="0" width="'+(W-L-R)+'" height="'+H+'" fill="transparent"/></svg>'
+  +'<div class="mtip" hidden></div>'+(clipped?'<p class="clip-note">A few spikes run past the axis and are drawn at its edge; hover for exact values.</p>':'');
+ var svg=$('svg',el),tip=$('.mtip',el),cross=$('.cross',el),cur=null;
+ function at(t){cur=t;var cx=X(t),r=svg.getBoundingClientRect();cross.setAttribute('x1',cx);cross.setAttribute('x2',cx);cross.setAttribute('visibility','visible');
+  var rows=vis.map(function(s,i){return {s:s,v:maps[i][t]}}).filter(function(x){return x.v!=null}).sort(function(a,b){return b.v-a.v});
+  tip.innerHTML='<div class="tt">'+local(t)+'</div>'+(rows.length?rows.map(function(x){return '<div class="row"><i class="key s'+x.s.slot+'"></i><b>'+rateTxt(x.v,2)+'</b><span>'+esc(x.s.label)+'</span></div>'}).join(''):'<div class="row"><span>No data for this hour</span></div>');
+  tip.hidden=false;var px=cx*r.width/W;tip.style.left=px+'px';tip.style.transform=px>r.width*.6?'translateX(calc(-100% - 10px))':'translateX(10px)'}
+ function hide(){tip.hidden=true;cross.setAttribute('visibility','hidden')}
+ function clampT(t){return Math.min(hi,Math.max(lo+3600,t))}
+ svg.addEventListener('pointermove',function(e){var r=svg.getBoundingClientRect(),sx=(e.clientX-r.left)*W/r.width;if(sx<L||sx>W-R){hide();return}
+  at(clampT(Math.round((lo+(sx-L)/(W-L-R)*(hi-lo))/3600)*3600))});
+ svg.addEventListener('pointerleave',hide);svg.addEventListener('blur',hide);svg.addEventListener('focus',function(){at(cur==null?hi:cur)});
+ svg.addEventListener('keydown',function(e){if(e.key!=='ArrowLeft'&&e.key!=='ArrowRight')return;e.preventDefault();at(clampT((cur==null?hi:cur)+(e.key==='ArrowRight'?3600:-3600)))})}
+document.addEventListener('click',function(e){
+ var rb=e.target.closest('#asset-detail [data-range]');if(rb){MK.range=+rb.dataset.range;store('mk_range',String(MK.range));renderAsset();return}
+ var sb=e.target.closest('#asset-detail [data-series]');if(sb){var k=sb.dataset.series;MK.hidden[k]=!MK.hidden[k];renderAsset();return}
+ var ar=e.target.closest('[data-asset]');if(!ar||e.target.closest('th'))return;openAsset(ar.dataset.asset);
+ var box=$('#asset-detail');if(box&&box.getBoundingClientRect().top<0)box.scrollIntoView({behavior:'smooth',block:'start'})});
+var mkResize=null;window.addEventListener('resize',function(){clearTimeout(mkResize);mkResize=setTimeout(function(){if(MK.data&&!$('#tab-markets').hidden)renderAsset()},150)});
 // refresh every 5 minutes unless the detail panel is open or the filter has focus
 setInterval(function(){if(!drawer.classList.contains('is-open')&&document.activeElement!==q)location.reload()},300000);
 })();
@@ -801,6 +998,11 @@ class _Handler(BaseHTTPRequestHandler):
             conn = connect(self.server.db_path)  # one connection per request: requests run on their own threads
             if url.path in ("/", "/index.html"):
                 self._send(200, build_page(conn, db_path=self.server.db_path).encode(), "text/html; charset=utf-8")
+            elif url.path == "/api/asset":
+                a = (parse_qs(url.query).get("a") or [""])[0]
+                d = asset_detail(conn, a)
+                body = json.dumps(d if d is not None else {"error": "This asset is not tracked."})
+                self._send(200 if d is not None else 404, body.encode(), "application/json")
             elif url.path == "/api/pair":
                 pid = (parse_qs(url.query).get("id") or [""])[0]
                 d = pair_detail(conn, pid)

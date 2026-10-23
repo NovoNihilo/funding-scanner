@@ -39,8 +39,9 @@ hour, UTC), so a restart never lands on one.
    - **Suspended**: was qualified, now failing a check. **Terminated**: the run was killed.
 4. **Costs** (`src/costs.py`, informational only): round-trip cost from live order books (taker) and fees (maker),
    payback time at the current 24h rate, expected net over 7 days, and a 24h stress test that caps leverage.
-5. **Dashboard** (`src/dashboard.py`): tabs for Opportunities, Watchlist, Health and Activity, with a detail panel
-   per pair showing its last 7 days hour by hour.
+5. **Dashboard** (`src/dashboard.py`): tabs for Opportunities, Watchlist, Markets, Health and Activity, with a detail
+   panel per pair showing its last 7 days hour by hour. Markets (`src/markets.py`) charts every tracked asset's funding
+   on each venue and its spread against Variational over 1 to 14 days.
 
 ## Checking Variational estimates against real payments
 
