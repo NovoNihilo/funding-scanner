@@ -1,7 +1,8 @@
 # Funding scanner
 
 A read-only scanner for cross-venue funding-rate arbitrage between Variational, Hyperliquid (main dex plus the
-`xyz` HIP-3 builder dex) and Lighter. Every tracked pair has one leg on Variational. It never places trades.
+`xyz` HIP-3 builder dex), Lighter and RISEx (crypto markets only). Every tracked pair has one leg on Variational.
+It never places trades.
 
 It runs on a small DigitalOcean server (systemd service `funding-scanner`). You view it through a private SSH
 tunnel; nothing is exposed to the internet.
@@ -25,7 +26,7 @@ hour, UTC), so a restart never lands on one.
 1. **Matching** (`src/matching.py`): an asset is tracked only if Variational and at least one other venue list it
    at the same price (within 3%). Prices quoted at a power-of-ten scale are reconciled. HIP-3 markets come only from
    allowlisted deployers (`HIP3_DEXES`).
-2. **Funding history** (`src/funding.py`): Hyperliquid and Lighter settled funding is fetched every hour with
+2. **Funding history** (`src/funding.py`): Hyperliquid, Lighter and RISEx settled funding is fetched every hour with
    7 days of backfill and automatic gap repair. Variational has no history API, so the worker snapshots it every
    5 minutes plus 3 minutes, 90 seconds and 30 seconds before each settlement, and records each settlement as soon
    as it passes (estimated from the last snapshot before it; a late fallback of up to 1 hour is marked as such).

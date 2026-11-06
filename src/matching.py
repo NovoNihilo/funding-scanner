@@ -1,6 +1,7 @@
 """Cross-venue asset matching: normalize symbols, then validate by per-unit price agreement.
 Hyperliquid = main dex (crypto) + allowlisted HIP-3 builder dexes (HIP3_DEXES, default 'xyz': stocks, indices,
 commodities, FX). Each HIP-3 deployer runs its own oracle, so untrusted deployers are never fetched.
+RISEx = crypto markets only (RISEX_CATEGORIES); its stock, commodity and ETF markets are never fetched.
 HIP-3 markets whose asset is already listed on the main dex are skipped (duplicate crypto listings).
 Only assets that agree on price across >= 2 venues, one of them REQUIRED_VENUE (default Variational), are matched;
 everything else is stored but never synced or evaluated."""
@@ -9,10 +10,10 @@ import time
 from math import log10
 from statistics import median
 
-from src.config import HIP3_DEXES, PRICE_TOL, REQUIRED_VENUE
-from src.venues import hyperliquid as hl, lighter as lt, variational as va
+from src.config import HIP3_DEXES, PRICE_TOL, REQUIRED_VENUE, RISEX_CATEGORIES
+from src.venues import hyperliquid as hl, lighter as lt, risex as rx, variational as va
 
-VENUES = ("variational", "hyperliquid", "lighter")
+VENUES = ("variational", "hyperliquid", "lighter", "risex")
 ALIASES = {"WTI": "CL", "BRENTOIL": "BZ", "XCU": "COPPER", "GOLD": "XAU", "SILVER": "XAG",
            "PLATINUM": "XPT", "PALLADIUM": "XPD"}
 SCALE_TOL = 0.01  # power-of-ten rescue must agree within 1%
@@ -100,6 +101,27 @@ def fetch_lighter():
     return out
 
 
+def fetch_risex():
+    out = []
+    for m in rx.markets():
+        if not m.get("active") or str(m.get("category")) not in RISEX_CATEGORIES:
+            continue
+        cfg = m.get("config") or {}
+        flags = []
+        if m.get("reduce_only"):
+            flags.append("REDUCE_ONLY")
+        if cfg.get("unlocked") is False:
+            flags.append("LOCKED")
+        if m.get("post_only"):
+            flags.append("POST_ONLY")
+        ivl = int(m.get("funding_interval") or 3600 * 10 ** 9) // 10 ** 9
+        lev = float(cfg.get("max_leverage") or 0) or None
+        out.append(_row("risex", cfg.get("name") or m.get("display_name"), m["market_id"], ivl,
+                        float(m.get("mark_price") or m.get("last_price") or 0), float(m.get("quote_volume_24h") or 0),
+                        "crypto", flags, lev))
+    return out
+
+
 def fetch_variational():
     out = []
     for x in va.stats()["listings"]:
@@ -180,7 +202,12 @@ def save(conn, rows, venues):
 
 
 def refresh_markets(conn):
-    rows = fetch_variational() + fetch_hyperliquid() + fetch_lighter()
+    rows, venues = fetch_variational() + fetch_hyperliquid() + fetch_lighter(), list(VENUES[:3])
+    try:
+        rows += fetch_risex()
+        venues.append("risex")
+    except Exception:
+        pass  # RISEx down: keep its last known markets instead of failing the whole refresh
     validate(rows)
-    save(conn, rows, VENUES)
+    save(conn, rows, venues)
     return rows

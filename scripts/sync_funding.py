@@ -4,7 +4,7 @@ import time
 from src.config import BACKFILL_DAYS
 from src.db import connect
 from src.funding import (capture_variational, completeness, derive_variational, ingest_hyperliquid,
-                         ingest_lighter, record_run)
+                         ingest_lighter, ingest_risex, record_run)
 from src.matching import refresh_markets
 
 
@@ -19,13 +19,16 @@ def main():
     print(f"hyperliquid: {hls} ({time.time() - t0:.0f}s)")
     lts = ingest_lighter(conn, now, backfill_s, progress=True)
     print(f"lighter: {lts} ({time.time() - t0:.0f}s)")
+    rxs = ingest_risex(conn, now, backfill_s)
+    print(f"risex: {rxs} ({time.time() - t0:.0f}s)")
     n = capture_variational(conn, now)
     d = derive_variational(conn, now)
     print(f"variational: snapshot rows={n} derived settlements={d} (0 expected until snapshots span settlements)")
-    record_run(conn, "sync_funding", now, hls["errors"] + lts["errors"] == 0, {"hl": hls, "lt": lts})
+    record_run(conn, "sync_funding", now, hls["errors"] + lts["errors"] + rxs["errors"] == 0,
+               {"hl": hls, "lt": lts, "rx": rxs})
 
     print("\n=== COMPLETENESS (last backfill window) ===")
-    for venue in ("hyperliquid", "lighter"):
+    for venue in ("hyperliquid", "lighter", "risex"):
         rep = completeness(conn, venue, now - backfill_s)
         gaps = [r for r in rep if r[3] > 0]
         stale = conn.execute("SELECT COUNT(*) FROM (SELECT symbol, MAX(ts) m FROM settlements WHERE venue=? "
@@ -44,7 +47,7 @@ def main():
         print(f"  {r['venue']:<12} {r['source']:<11} {r['quality']:<10} n={r['n']:<6} avg_err={e}")
 
     print("\n=== BTC last 4 settlements (rate per interval) ===")
-    for venue, sym in (("hyperliquid", "BTC"), ("lighter", "BTC")):
+    for venue, sym in (("hyperliquid", "BTC"), ("lighter", "BTC"), ("risex", "BTC/USDC")):
         rows = conn.execute("SELECT ts, rate, source FROM settlements WHERE venue=? AND symbol=? "
                             "ORDER BY ts DESC LIMIT 4", (venue, sym)).fetchall()
         print(f"  {venue}: " + "  ".join(f"{time.strftime('%H:%M', time.gmtime(r['ts']))}={r['rate']:+.3e}"

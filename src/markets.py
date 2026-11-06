@@ -12,9 +12,9 @@ from src.signals import _load, var_hourly
 HOUR = 3600
 APR_FACTOR = 8760
 APY_FACTOR = 8760 / 2 if APY_BASIS == "capital" else 8760  # spread -> APY at 1x, as on the other tabs
-NAMES = {"variational": "Variational", "hyperliquid": "Hyperliquid", "lighter": "Lighter"}
-SHORT = {"variational": "VAR", "hyperliquid": "HL", "lighter": "LT"}
-SLOT = {"variational": 1, "hyperliquid": 2, "lighter": 3, "hip3": 4}  # fixed colour per venue, never by rank
+NAMES = {"variational": "Variational", "hyperliquid": "Hyperliquid", "lighter": "Lighter", "risex": "RISEx"}
+SHORT = {"variational": "VAR", "hyperliquid": "HL", "lighter": "LT", "risex": "RX"}
+SLOT = {"variational": 1, "hyperliquid": 2, "lighter": 3, "hip3": 4, "risex": 5}  # fixed colour per venue, never by rank
 MAX_DAYS = 14
 
 

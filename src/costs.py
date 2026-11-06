@@ -5,7 +5,7 @@ Round-trip cost per market, as a fraction of notional, in two execution styles:
 - maker: resting orders filled at the touch -> 2 x maker fee only (best case; fills are not guaranteed)
 Each leg of a pair is opened and later closed once, so a pair's cost is the sum of both markets' round trips
 plus any adverse cross-venue basis at entry.
-- Hyperliquid and Lighter: executable public order books. HIP-3 fees vary by deployer (fee scale, growth mode);
+- Hyperliquid, Lighter and RISEx: executable public order books (RISEx at its tier-1 fees, RX_TAKER/MAKER_FEE). HIP-3 fees vary by deployer (fee scale, growth mode);
   they are estimated as HIP3_FEE_MULT x the base fee and flagged HIP3_FEE_EST.
 - Variational: indicative RFQ quotes (cached up to 10 min by the venue) -> penalised; no maker option (RFQ only).
 """
@@ -13,9 +13,9 @@ import time
 from datetime import datetime, timezone
 
 from src.config import (COST_SIZES, DEFAULT_STRESS_MOVE, HIP3_FEE_MULT, HL_MAKER_FEE, HL_TAKER_FEE, MIN_STRESS_MOVE,
-                        PRICE_STATS_DAYS, STRESS_BUFFER, VAR_QUOTE_PENALTY, VAR_STALE_PENALTY, VAR_STALE_S,
-                        VAR_TAKER_FEE)
-from src.venues import hyperliquid as hl, lighter as lt
+                        PRICE_STATS_DAYS, RX_MAKER_FEE, RX_TAKER_FEE, STRESS_BUFFER, VAR_QUOTE_PENALTY,
+                        VAR_STALE_PENALTY, VAR_STALE_S, VAR_TAKER_FEE)
+from src.venues import hyperliquid as hl, lighter as lt, risex as rx
 
 HOUR = 3600
 
@@ -86,7 +86,7 @@ def p99_24h_move(closes):
 def stress_leverage(p99, legs):
     """Highest leverage where neither leg is liquidated by a buffered 24h adverse move.
     legs: [(venue, venue_max_leverage)]. Variational maintenance = half the initial margin at the CHOSEN
-    leverage (liquidation distance 1/(2L)); Hyperliquid/Lighter maintenance ~ half the initial at MAX leverage."""
+    leverage (liquidation distance 1/(2L)); Hyperliquid/Lighter/RISEx maintenance ~ half the initial at MAX leverage."""
     move = max(p99 if p99 is not None else DEFAULT_STRESS_MOVE, MIN_STRESS_MOVE) * STRESS_BUFFER
     safe = []
     for venue, vmax in legs:
@@ -133,6 +133,9 @@ def refresh_costs(conn, markets, now=None):
                     if ":" in symbol:
                         fee, maker_fee = fee * HIP3_FEE_MULT, maker_fee * HIP3_FEE_MULT
                         base_flags.append("HIP3_FEE_EST")
+                elif venue == "risex":
+                    bids, asks = rx.order_book(market_id)
+                    fee, maker_fee = RX_TAKER_FEE, RX_MAKER_FEE
                 else:
                     if lt_fees is None:  # fees are quoted in percent
                         lt_fees = {str(d["market_id"]): (float(d.get("taker_fee") or 0) / 100,

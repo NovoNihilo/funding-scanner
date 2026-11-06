@@ -5,7 +5,7 @@ import time
 
 from src.config import (EVENTS_KEEP_DAYS, RUNS_KEEP_DAYS, VAR_LATE_WINDOW_S, VAR_PRE_CAPTURE_S, VAR_RATE_SOURCE, VAR_SNAPSHOT_KEEP_DAYS,
                         VAR_WINDOW_S)
-from src.venues import hyperliquid as hl, lighter as lt, variational as va
+from src.venues import hyperliquid as hl, lighter as lt, risex as rx, variational as va
 
 HOUR = 3600
 LT_RATE_QUANTUM = 1e-6   # Lighter 'rate' is percent with 4 dp
@@ -155,6 +155,39 @@ def ingest_lighter(conn, now, backfill_s, progress=False):
             _mark(conn, "lighter", sym, now, None, repr(e)[:300])
         if progress and i % 25 == 0:
             print(f"  lighter {i}/{len(markets)}", flush=True)
+    return stats
+
+
+# ---------------- RISEx ----------------
+
+def risex_rows(sym, records):
+    """Settlement rows from RISEx funding records: ts = end of the hourly period (s), rate = fraction per hour."""
+    rows = []
+    for r in records:
+        if r.get("funding_rate") in (None, "") or not r.get("end_time"):
+            continue
+        end = int(r["end_time"]) // rx.NS
+        start = int(r.get("start_time") or 0) // rx.NS
+        ivl = (end - start) if 0 < end - start <= 8 * HOUR else HOUR
+        rows.append(("risex", sym, int(round(end / HOUR)) * HOUR, ivl, float(r["funding_rate"]) + 0.0, 0.0,
+                     "CONFIRMED", "rx_history", json.dumps({"index_price": r.get("index_price")})))
+    return rows
+
+
+def ingest_risex(conn, now, backfill_s):
+    stats = {"markets": 0, "written": 0, "errors": 0, "gap_repairs": 0}
+    for m in matched_markets(conn, "risex"):
+        sym = m["symbol"]
+        stats["markets"] += 1
+        try:
+            start, repair = _since(conn, "risex", sym, now, backfill_s)
+            stats["gap_repairs"] += repair
+            rows = risex_rows(sym, rx.funding_history(m["market_id"], start, now + 1))
+            stats["written"] += insert_settlements(conn, rows)
+            _mark(conn, "risex", sym, now, max((r[2] for r in rows), default=None))
+        except Exception as e:
+            stats["errors"] += 1
+            _mark(conn, "risex", sym, now, None, repr(e)[:300])
     return stats
 
 

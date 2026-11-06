@@ -1,7 +1,7 @@
 """Always-on worker.
 Thread 'var':  Variational snapshot every 5 min (:00:30, :05:30, ...) plus extra captures VAR_PRE_CAPTURE_S seconds
                before every announced settlement; settlements are derived right after each capture.
-Thread 'sync': at start-up, then hourly at hh:04 -> refresh markets, HL + Lighter settled funding (with gap repair),
+Thread 'sync': at start-up, then hourly at hh:04 -> refresh markets, HL + Lighter + RISEx settled funding (gap repair),
                costs for candidate pairs, 24h-move stats, signals, housekeeping, timing verdict.
 Thread 'dash': read-only dashboard on DASHBOARD_HOST:DASHBOARD_PORT (localhost; open it through the SSH tunnel).
 Watchdog: the process exits (systemd restarts it within seconds) if a thread dies, the Variational loop stalls for
@@ -17,7 +17,7 @@ from src.costs import refresh_costs, refresh_price_stats
 from src.dashboard import serve
 from src.db import connect
 from src.funding import (capture_variational, derive_variational, housekeeping, ingest_hyperliquid, ingest_lighter,
-                         next_capture_time, record_run, upcoming_settlements)
+                         ingest_risex, next_capture_time, record_run, upcoming_settlements)
 from src.matching import refresh_markets
 from src.signals import evaluate_all, market_index, prioritized_assets
 from src.var_timing import timing_report
@@ -78,8 +78,10 @@ def sync_loop():
             refresh_markets(conn)
             hls = ingest_hyperliquid(conn, t0, backfill_s)
             lts = ingest_lighter(conn, t0, backfill_s)
-            log.info("sync hl=%s lt=%s took=%ds", hls, lts, int(time.time()) - t0)
-            record_run(conn, "sync", t0, hls["errors"] + lts["errors"] == 0, {"hl": hls, "lt": lts})
+            rxs = ingest_risex(conn, t0, backfill_s)
+            log.info("sync hl=%s lt=%s rx=%s took=%ds", hls, lts, rxs, int(time.time()) - t0)
+            record_run(conn, "sync", t0, hls["errors"] + lts["errors"] + rxs["errors"] == 0,
+                       {"hl": hls, "lt": lts, "rx": rxs})
             pre = evaluate_all(conn, persist=False)
             cst = refresh_costs(conn, pre["candidates"])
             pst = refresh_price_stats(conn, prioritized_assets(market_index(conn), pre["candidates"]), max_n=40)

@@ -35,7 +35,7 @@ from src.config import (ANOMALY_MAD_K, ANOMALY_MIN_HOURLY, APY_BASIS, COST_MAX_A
 from src.costs import stress_leverage
 
 HOUR = 3600
-BLOCKING_FLAGS = {"REDUCE_ONLY", "HIDDEN", "PREIPO", "NO_FUNDING"}
+BLOCKING_FLAGS = {"REDUCE_ONLY", "HIDDEN", "PREIPO", "NO_FUNDING", "LOCKED"}
 COHORTS = ((EMERGING_MIN_H, "FRESH"), (QUALIFY_MIN_H, "EMERGING"), (48, "ACTIONABLE"), (168, "ESTABLISHED"))
 COST_CANDIDATE_FRACTION = 0.8  # fetch execution costs for pairs within 80% of the APY minimum
 STALE_AFTER_H = 3  # no complete hour for this long -> stale

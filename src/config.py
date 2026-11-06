@@ -18,6 +18,8 @@ DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8765"))
 HIP3_DEXES = [d.strip() for d in os.environ.get("HIP3_DEXES", "xyz").split(",") if d.strip()]
 # Every tracked pair must have one leg on this venue (empty = all cross-venue pairs).
 REQUIRED_VENUE = os.environ.get("REQUIRED_VENUE", "variational").strip()
+# RISEx market categories to track (comma list of: crypto, stocks, commodity, index_etf).
+RISEX_CATEGORIES = [c.strip() for c in os.environ.get("RISEX_CATEGORIES", "crypto").split(",") if c.strip()]
 
 # Signal economics
 MIN_APY_1X = float(os.environ.get("MIN_APY_1X", "0.05"))  # minimum funding APY at 1x
@@ -50,6 +52,8 @@ COST_MAX_AGE_S = int(os.environ.get("COST_MAX_AGE_S", "7200"))  # older cost est
 HL_TAKER_FEE = float(os.environ.get("HL_TAKER_FEE", "0.00045"))  # Hyperliquid base tier taker fee
 HL_MAKER_FEE = float(os.environ.get("HL_MAKER_FEE", "0.00015"))  # Hyperliquid base tier maker fee
 HIP3_FEE_MULT = float(os.environ.get("HIP3_FEE_MULT", "2.0"))  # HIP-3 markets: deployer fee share, ~2x base
+RX_TAKER_FEE = float(os.environ.get("RX_TAKER_FEE", "0.0003"))  # RISEx tier 1 taker fee (3 bps)
+RX_MAKER_FEE = float(os.environ.get("RX_MAKER_FEE", "0.0001"))  # RISEx tier 1 maker fee (1 bp)
 VAR_TAKER_FEE = float(os.environ.get("VAR_TAKER_FEE", "0"))  # Variational Omni charges no trading fee
 VAR_QUOTE_PENALTY = float(os.environ.get("VAR_QUOTE_PENALTY", "1.25"))  # indicative (RFQ) quotes
 VAR_STALE_PENALTY = float(os.environ.get("VAR_STALE_PENALTY", "2.0"))  # quotes older than VAR_STALE_S

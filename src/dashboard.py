@@ -25,7 +25,9 @@ HOUR = 3600
 KILL_RULE = (f"A run is killed when {TERMINATE_AFTER} or more unprofitable hours in a row lose more than "
              f"{KILL_LOSS_SHARE:.0%} of what it earned in the {KILL_CUSHION_H} hours before them, or after "
              f"{TERMINATE_HARD_AFTER} in a row whatever their size.")
-VENUE = {"hyperliquid": ("HL", "Hyperliquid"), "lighter": ("LT", "Lighter"), "variational": ("VAR", "Variational")}
+VENUE = {"hyperliquid": ("HL", "Hyperliquid"), "lighter": ("LT", "Lighter"), "variational": ("VAR", "Variational"),
+         "risex": ("RX", "RISEx")}
+SYNCED = ("hyperliquid", "lighter", "risex")  # venues with an official funding history, synced hourly
 STATUS = {"QUALIFIED": "Qualified", "EMERGING": "Emerging", "SUSPENDED": "Suspended", "MONITORING": "Monitoring",
           "TERMINATED": "Terminated"}
 STATUS_ORDER = {"QUALIFIED": 0, "EMERGING": 1, "SUSPENDED": 2, "MONITORING": 3, "TERMINATED": 4}
@@ -53,7 +55,7 @@ FLAG_PREFIX = {
 }
 BLOCK_TEXT = {"REDUCE_ONLY": "is reduce-only: new positions can't be opened",
               "HIDDEN": "is hidden by the venue", "PREIPO": "is a pre-IPO market with no regular funding",
-              "NO_FUNDING": "has no funding"}
+              "NO_FUNDING": "has no funding", "LOCKED": "is locked by the venue: new positions can't be opened"}
 REASON_RULES = [
     (r"^APY 1x ([\d.]+%) < (\d+%)$", "APY {0} is under the {1} minimum"),
     (r"^run APY 1x ([\d.]+%) < (\d+%)$", "APY so far ({0}) is under the {1} minimum"),
@@ -64,7 +66,7 @@ REASON_RULES = [
     (r"^median hourly net <= 0 \(48h\)$", "The typical hour isn't profitable (48h)"),
     (r"^coverage (\d+%) < (\d+%) \((24h|run)\)$", "Only {0} of hours have data"),
     (r"^stale data$", "No fresh data for 3h+"),
-    (r"^(hyperliquid|lighter|variational) (\w+)$", "{0} market {1}"),
+    (r"^(hyperliquid|lighter|variational|risex) (\w+)$", "{0} market {1}"),
 ]
 
 
@@ -110,7 +112,7 @@ def health(conn, now, db_path=None):
         issues.append(("INFO", f"{cov24['late']} Variational settlement(s) in 24h used the late fallback snapshot"))
     matched = {(r[0], r[1]) for r in conn.execute("SELECT venue, symbol FROM markets WHERE matched=1 AND active=1")}
     venues = {}
-    for venue in ("hyperliquid", "lighter"):
+    for venue in SYNCED:
         rep = [r for r in completeness(conn, venue, now - 7 * 86400) if (venue, r[0]) in matched]
         last = {r[0]: r[1] for r in conn.execute(
             "SELECT symbol, MAX(ts) FROM settlements WHERE venue=? GROUP BY symbol", (venue,))}
@@ -200,9 +202,9 @@ def flag_notes(flags):
         for prefix, tmpl in FLAG_PREFIX.items():
             if f.startswith(prefix):
                 text = tmpl.format(n=f[len(prefix):])
-        m = re.match(r"^(HYP|LIG|VAR)_(\w+)$", f)
+        m = re.match(r"^(HYP|LIG|VAR|RIS)_(\w+)$", f)
         if m and m.group(2) in BLOCK_TEXT:
-            text = f"The {dict(HYP='Hyperliquid', LIG='Lighter', VAR='Variational')[m.group(1)]} market " \
+            text = f"The {dict(HYP='Hyperliquid', LIG='Lighter', VAR='Variational', RIS='RISEx')[m.group(1)]} market " \
                    f"{BLOCK_TEXT[m.group(2)]}."
         out.append({"code": f, "text": text or f})
     return out
@@ -412,7 +414,7 @@ def health_tab(h, warming):
     sync = h["sync"]
     detail = json.loads(sync["detail"] or "{}") if sync else {}
     took = (sync["finished_at"] - sync["started_at"]) if sync else None
-    repairs = sum((detail.get(k) or {}).get("gap_repairs", 0) for k in ("hl", "lt"))
+    repairs = sum((detail.get(k) or {}).get("gap_repairs", 0) for k in ("hl", "lt", "rx"))
     nxt = h["next_settlement"]
     groups = [
         ("Variational", [("Last snapshot", f"{age(h['snap_age'])} ago"),
@@ -420,10 +422,9 @@ def health_tab(h, warming):
                          ("Settlements captured, 24h", f"{c24['captured']} of {c24['expected']}"),
                          ("Settlements captured, 72h", f"{c72['captured']} of {c72['expected']}"),
                          ("Late fallbacks, 24h", str(c24["late"]))]),
-        ("Hyperliquid and Lighter", [("Last sync", f"{age(h['sync_age'])} ago, took {age(took)}"),
-                                     ("Hyperliquid markets", f"{v['hyperliquid']['markets']}, {v['hyperliquid']['gaps']} with gaps"),
-                                     ("Lighter markets", f"{v['lighter']['markets']}, {v['lighter']['gaps']} with gaps"),
-                                     ("Gaps repaired, last sync", str(repairs))]),
+        ("Hyperliquid, Lighter and RISEx", [("Last sync", f"{age(h['sync_age'])} ago, took {age(took)}")]
+         + [(f"{VENUE[x][1]} markets", f"{v[x]['markets']}, {v[x]['gaps']} with gaps") for x in SYNCED]
+         + [("Gaps repaired, last sync", str(repairs))]),
         ("Server", [("Worker uptime", age(h["uptime"])), ("Restarts, 24h", str(h["restarts_24h"])),
                     ("Database", f"{h['db_mb']:.0f} MB"),
                     ("Disk free", "n/a" if h["free_gb"] is None else f"{h['free_gb']:.1f} GB")]),
@@ -503,7 +504,7 @@ def markets_tab(rows):
     out = []
     for r in rows:
         cells = "".join(market_cell([m for m in r["markets"] if m["venue"] == v])
-                        for v in ("variational", "hyperliquid", "lighter"))
+                        for v in ("variational", "hyperliquid", "lighter", "risex"))
         b = r["best"]
         if b:
             side = f'Short VAR, long {esc(b["other"])}' if b["short_var"] else f'Long VAR, short {esc(b["other"])}'
@@ -516,7 +517,7 @@ def markets_tab(rows):
                    f'<td class="c-asset" data-v="{esc(r["asset"])}"><button class="open" data-asset="{esc(r["asset"])}">'
                    f'{esc(r["asset"])}</button><span class="sub">{"RWA" if r["class"] == "tradfi" else "Crypto"}</span></td>'
                    f'{cells}{sp}<td class="n" data-v="{ivl or 0}">{f"{ivl // 3600}h" if ivl else "n/a"}</td></tr>')
-    heads = [("Asset", "c-asset"), ("Variational", "n"), ("Hyperliquid", "n"), ("Lighter", "n"),
+    heads = [("Asset", "c-asset"), ("Variational", "n"), ("Hyperliquid", "n"), ("Lighter", "n"), ("RISEx", "n"),
              ("Widest spread, 24h", "n"), ("Variational settles", "n")]
     th = "".join(f'<th class="{c}" scope="col"><button class="sort" data-col="{i}">{h}</button></th>'
                  for i, (h, c) in enumerate(heads))
@@ -613,11 +614,11 @@ PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <style>
 :root{--paper:#f3f5f8;--surface:#fff;--ink:#161a21;--ink2:#4b5563;--muted:#6b7380;--rule:#e3e7ec;--rule2:#eef1f4;
 --pos:#2a78d6;--neg:#e34948;--ex:#b8bfc9;--good:#0e8a0e;--warn:#a86a00;--fail:#c8322f;--focus:#2a78d6;
---goodbg:#e6f4e6;--warnbg:#fbf1dc;--failbg:#fbe7e6;--chip:#eef1f4;--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100}
+--goodbg:#e6f4e6;--warnbg:#fbf1dc;--failbg:#fbe7e6;--chip:#eef1f4;--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#e87ba4}
 @media (prefers-color-scheme:dark){:root{--paper:#141920;--surface:#1b212b;--ink:#e9edf2;--ink2:#b4bcc8;--muted:#8a93a1;
 --rule:#2a313d;--rule2:#232a35;--pos:#3987e5;--neg:#e66767;--ex:#4a5260;--good:#4cc76a;--warn:#e7b04a;--fail:#ff7a6b;
 --focus:#3987e5;--goodbg:#173022;--warnbg:#2f2614;--failbg:#351b1c;--chip:#262d39;--s1:#3987e5;--s2:#d95926;
---s3:#199e70;--s4:#c98500}}
+--s3:#199e70;--s4:#c98500;--s5:#d55181}}
 *{box-sizing:border-box}
 html{background:var(--paper)}
 body{margin:0;color:var(--ink);font:15px/1.5 "IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
@@ -744,7 +745,7 @@ details.tbl table{font-size:13px}details.tbl td,details.tbl th{padding:5px 8px}
 .vcard dl{display:grid;grid-template-columns:1fr auto;gap:4px 10px;margin:10px 0 0;font-size:13px}
 .vcard dt{color:var(--muted)}.vcard dd{margin:0;text-align:right}
 .key{display:inline-block;width:14px;height:3px;border-radius:2px;flex:none}
-.key.s1{background:var(--s1)}.key.s2{background:var(--s2)}.key.s3{background:var(--s3)}.key.s4{background:var(--s4)}
+.key.s1{background:var(--s1)}.key.s2{background:var(--s2)}.key.s3{background:var(--s3)}.key.s4{background:var(--s4)}.key.s5{background:var(--s5)}
 .a-chart{margin-top:22px}
 .a-ct{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 12px;margin-bottom:8px}
 .a-ct h4{margin:0;font:600 15px/1.3 "IBM Plex Sans Condensed","IBM Plex Sans",sans-serif}.a-ct span{font-size:13px}
@@ -753,8 +754,8 @@ details.tbl table{font-size:13px}details.tbl td,details.tbl th{padding:5px 8px}
  padding:3px 11px;cursor:pointer;font-size:12.5px;color:var(--ink2)}
 .lg-toggle button[aria-pressed=false]{opacity:.45;text-decoration:line-through}
 .chart .ln{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
-.chart .ln.s1{stroke:var(--s1)}.chart .ln.s2{stroke:var(--s2)}.chart .ln.s3{stroke:var(--s3)}.chart .ln.s4{stroke:var(--s4)}
-.chart .pt.s1{fill:var(--s1)}.chart .pt.s2{fill:var(--s2)}.chart .pt.s3{fill:var(--s3)}.chart .pt.s4{fill:var(--s4)}
+.chart .ln.s1{stroke:var(--s1)}.chart .ln.s2{stroke:var(--s2)}.chart .ln.s3{stroke:var(--s3)}.chart .ln.s4{stroke:var(--s4)}.chart .ln.s5{stroke:var(--s5)}
+.chart .pt.s1{fill:var(--s1)}.chart .pt.s2{fill:var(--s2)}.chart .pt.s3{fill:var(--s3)}.chart .pt.s4{fill:var(--s4)}.chart .pt.s5{fill:var(--s5)}
 .chart .dl{fill:var(--ink2);font:12px "IBM Plex Sans",sans-serif}
 .chart .tick{stroke:var(--rule)}.chart .guide{stroke:var(--ink2);stroke-dasharray:4 4;stroke-opacity:.6}
 .chart svg:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
@@ -773,7 +774,7 @@ details.tbl table{font-size:13px}details.tbl td,details.tbl th{padding:5px 8px}
 .tag{font:600 10.5px/1 "IBM Plex Sans Condensed",sans-serif;padding:2px 4px;border-radius:3px;background:var(--chip);
  color:var(--ink2);margin-left:5px;vertical-align:1px}
 tr.is-sel td{background:var(--rule2)}tr.is-sel td:first-child{box-shadow:inset 3px 0 0 var(--ink)}
-@media (max-width:820px){.asset{padding:14px 12px 16px}.mkts th:nth-child(6),.mkts td:nth-child(6){display:none}}
+@media (max-width:820px){.asset{padding:14px 12px 16px}.mkts th:nth-child(7),.mkts td:nth-child(7){display:none}}
 @media (max-width:820px){.top,.bar,main{padding-left:16px;padding-right:16px}.filters{width:100%}input{flex:1;width:auto}
  .c-trend,.c-net,.c-age,.c-spark{display:none}.d-figs{grid-template-columns:repeat(2,1fr)}.drawer-body{padding:20px 16px 40px}}
 @media (prefers-reduced-motion:reduce){.drawer{transition:none}}
