@@ -42,7 +42,9 @@ hour, UTC), so a restart never lands on one.
    payback time at the current 24h rate, expected net over 7 days, and a 24h stress test that caps leverage.
 5. **Dashboard** (`src/dashboard.py`): tabs for Opportunities, Watchlist, Markets, Health and Activity, with a detail
    panel per pair showing its last 7 days hour by hour. Markets (`src/markets.py`) charts every tracked asset's funding
-   on each venue and its spread against Variational over 1 to 14 days.
+   on each venue and its spread against Variational over 1 to 14 days. Volume (`src/volume.py`) ranks every shared
+   asset by the cheapest delta-neutral round trip (both legs' spread, slippage and fees) per $10k of Variational
+   volume, at $1k to $100k a leg, from order books swept hourly after the signals.
 
 ## Checking Variational estimates against real payments
 
@@ -75,6 +77,8 @@ All settings are environment variables with sensible defaults (`src/config.py`).
 | `HOLD_HORIZON_H` | `168` | holding period used for ranking |
 | `VAR_PRE_CAPTURE_S` | `180,90,30` | extra Variational captures before each settlement |
 | `VAR_SNAPSHOT_KEEP_DAYS`, `RUNS_KEEP_DAYS`, `EVENTS_KEEP_DAYS` | `3`, `30`, `30` | data retention |
+| `VOLUME_SIZES` | `1000,...,100000` | USD per leg priced on the Volume tab |
+| `VOLUME_SWEEP`, `VOLUME_SWEEP_MAX_S` | `1`, `900` | hourly order-book sweep for the Volume tab, and its time limit |
 | `DASHBOARD_PORT` | `8765` | dashboard port on the server's localhost |
 
 ## Repository layout

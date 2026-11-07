@@ -12,7 +12,7 @@ plus any adverse cross-venue basis at entry.
 import time
 from datetime import datetime, timezone
 
-from src.config import (COST_SIZES, DEFAULT_STRESS_MOVE, HIP3_FEE_MULT, HL_MAKER_FEE, HL_TAKER_FEE, MIN_STRESS_MOVE,
+from src.config import (BOOK_SIZES, DEFAULT_STRESS_MOVE, HIP3_FEE_MULT, HL_MAKER_FEE, HL_TAKER_FEE, MIN_STRESS_MOVE,
                         PRICE_STATS_DAYS, RX_MAKER_FEE, RX_TAKER_FEE, STRESS_BUFFER, VAR_QUOTE_PENALTY,
                         VAR_STALE_PENALTY, VAR_STALE_S, VAR_TAKER_FEE)
 from src.venues import hyperliquid as hl, lighter as lt, risex as rx
@@ -106,15 +106,22 @@ def _save_costs(conn, rows):
                          "flags, captured_at, rt_cost_maker) VALUES (?,?,?,?,?,?,?,?,?)", rows)
 
 
-def refresh_costs(conn, markets, now=None):
-    """markets: iterable of (venue, symbol, market_id). Stores round-trip costs for every COST_SIZES entry."""
+def refresh_costs(conn, markets, now=None, deadline=None):
+    """markets: iterable of (venue, symbol, market_id), refreshed in the order given (duplicates dropped).
+    Stores round-trip costs for every BOOK_SIZES entry. Stops early once time.time() passes `deadline`.
+    Hyperliquid sends 20 levels a side; sizes they cannot fill are priced from grouped books (4, then 3 significant
+    figures), which reach deeper at coarser prices, and are flagged AGG_BOOK."""
     now = int(now or time.time())
     stats = {"markets": 0, "errors": 0, "no_depth": 0}
     lt_fees = None
     var_snaps = {r["symbol"]: r for r in conn.execute(
         "SELECT * FROM var_snapshots s WHERE captured_at = (SELECT MAX(captured_at) FROM var_snapshots "
         "WHERE symbol = s.symbol)")}
-    for venue, symbol, market_id in sorted(set(markets)):
+    todo = list(dict.fromkeys(markets))
+    for i, (venue, symbol, market_id) in enumerate(todo):
+        if deadline is not None and time.time() > deadline:
+            stats["skipped"] = len(todo) - i
+            break
         stats["markets"] += 1
         rows = []
         try:
@@ -122,7 +129,7 @@ def refresh_costs(conn, markets, now=None):
                 snap = var_snaps.get(symbol)
                 if snap is None:
                     continue
-                for size in COST_SIZES:
+                for size in BOOK_SIZES:
                     cost, mid, flags = var_round_trip(snap, size, now)
                     rows.append((venue, symbol, size, cost, mid, 0, ",".join(flags), now, cost))
             else:
@@ -143,9 +150,19 @@ def refresh_costs(conn, markets, now=None):
                                    for d in lt.order_book_details("perp")}
                     bids, asks = lt.order_book_orders(int(market_id))
                     fee, maker_fee = lt_fees.get(str(market_id), (0.0, 0.0))
-                for size in COST_SIZES:
+                deeper = []  # HL grouped books, fetched only if needed
+                for size in BOOK_SIZES:
                     cost, mid = book_round_trip(bids, asks, size, fee)
-                    flags = ",".join(base_flags + ([] if cost is not None else ["NO_DEPTH"]))
+                    extra = []
+                    if cost is None and venue == "hyperliquid":
+                        for figs in (4, 3):
+                            if len(deeper) < (5 - figs):
+                                deeper.append(hl.l2_book(symbol, figs))
+                            cost = book_round_trip(*deeper[4 - figs], size, fee)[0]
+                            if cost is not None:
+                                extra = ["AGG_BOOK"]
+                                break
+                    flags = ",".join(base_flags + extra + ([] if cost is not None else ["NO_DEPTH"]))
                     stats["no_depth"] += cost is None
                     maker = 2 * maker_fee if cost is not None else None
                     rows.append((venue, symbol, size, cost, mid, 1, flags, now, maker))

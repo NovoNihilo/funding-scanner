@@ -49,6 +49,12 @@ HOLD_HORIZON_H = float(os.environ.get("HOLD_HORIZON_H", "168"))  # ranking: expe
 PAYBACK_FAST_H = float(os.environ.get("PAYBACK_FAST_H", "24"))  # payback label thresholds
 PAYBACK_OK_H = float(os.environ.get("PAYBACK_OK_H", "72"))
 COST_MAX_AGE_S = int(os.environ.get("COST_MAX_AGE_S", "7200"))  # older cost estimates count as missing
+# Volume tab: hourly sweep of every shared asset's order books, after signals (time-boxed, oldest first)
+VOLUME_SWEEP = os.environ.get("VOLUME_SWEEP", "1") == "1"
+VOLUME_SWEEP_MAX_S = int(os.environ.get("VOLUME_SWEEP_MAX_S", "900"))
+VOLUME_MAX_AGE_S = int(os.environ.get("VOLUME_MAX_AGE_S", "7200"))  # older books are left out of the ranking
+VOLUME_SIZES = [float(x) for x in os.environ.get("VOLUME_SIZES", "1000,5000,10000,25000,50000,100000").split(",")]
+BOOK_SIZES = sorted(set(COST_SIZES) | set(VOLUME_SIZES))  # every size a fetched book is walked at
 HL_TAKER_FEE = float(os.environ.get("HL_TAKER_FEE", "0.00045"))  # Hyperliquid base tier taker fee
 HL_MAKER_FEE = float(os.environ.get("HL_MAKER_FEE", "0.00015"))  # Hyperliquid base tier maker fee
 HIP3_FEE_MULT = float(os.environ.get("HIP3_FEE_MULT", "2.0"))  # HIP-3 markets: deployer fee share, ~2x base

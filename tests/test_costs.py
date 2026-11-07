@@ -52,8 +52,8 @@ def test_stress_leverage():
 
 
 def test_refresh_costs_stores_taker_and_maker(monkeypatch):
-    book = ([(99.99, 100.0)], [(100.01, 100.0)])
-    monkeypatch.setattr(costs.hl, "l2_book", lambda coin: book)
+    book = ([(99.99, 2000.0)], [(100.01, 2000.0)])  # $200k a side: every size up to $100k fills
+    monkeypatch.setattr(costs.hl, "l2_book", lambda coin, figs=None: book)
     monkeypatch.setattr(costs.lt, "order_book_orders", lambda mid: book)
     monkeypatch.setattr(costs.lt, "order_book_details",
                         lambda f="perp": [{"market_id": 7, "taker_fee": "0.0200", "maker_fee": "0.0040"}])
@@ -68,3 +68,33 @@ def test_refresh_costs_stores_taker_and_maker(monkeypatch):
     assert abs(r["hyperliquid"]["rt_cost_maker"] - 2 * 0.00015) < 1e-12
     assert abs(r["lighter"]["rt_cost"] - (0.0002 + 2 * 0.0002)) < 1e-9  # percent fees converted
     assert abs(r["lighter"]["rt_cost_maker"] - 2 * 0.00004) < 1e-12
+
+
+def test_hyperliquid_sizes_past_20_levels_use_grouped_books(monkeypatch):
+    shallow = ([(99.99, 150.0)], [(100.01, 150.0)])                     # $15k a side at full precision
+    grouped = ([(99.9, 5000.0)], [(100.1, 5000.0)])                     # nSigFigs=4: coarser, $500k deep
+    calls = []
+
+    def l2(coin, figs=None):
+        calls.append(figs)
+        return grouped if figs == 4 else shallow
+
+    monkeypatch.setattr(costs.hl, "l2_book", l2)
+    conn = connect(":memory:")
+    stats = costs.refresh_costs(conn, [("hyperliquid", "ALT", "ALT")], now=1000)
+    assert stats["no_depth"] == 0 and calls == [None, 4]                # one extra request, reused for all sizes
+    rows = {r["size_usd"]: r for r in conn.execute("SELECT * FROM book_costs WHERE symbol='ALT'")}
+    assert rows[10000]["flags"] == "" and abs(rows[10000]["rt_cost"] - (0.0002 + 2 * 0.00045)) < 1e-9
+    assert rows[100000]["flags"] == "AGG_BOOK" and abs(rows[100000]["rt_cost"] - (0.002 + 2 * 0.00045)) < 1e-9
+
+
+def test_refresh_costs_keeps_order_and_stops_at_deadline(monkeypatch):
+    seen = []
+    monkeypatch.setattr(costs.hl, "l2_book", lambda coin, figs=None: seen.append(coin) or
+                        ([(99.99, 2000.0)], [(100.01, 2000.0)]))
+    conn = connect(":memory:")
+    st = costs.refresh_costs(conn, [("hyperliquid", "B", "B"), ("hyperliquid", "A", "A"), ("hyperliquid", "B", "B")],
+                             now=1000)
+    assert seen == ["B", "A"] and st["markets"] == 2                     # given order, duplicates dropped
+    st = costs.refresh_costs(conn, [("hyperliquid", "C", "C")], now=1000, deadline=0)
+    assert st["markets"] == 0 and st["skipped"] == 1

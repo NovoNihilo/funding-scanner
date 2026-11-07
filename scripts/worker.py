@@ -2,7 +2,8 @@
 Thread 'var':  Variational snapshot every 5 min (:00:30, :05:30, ...) plus extra captures VAR_PRE_CAPTURE_S seconds
                before every announced settlement; settlements are derived right after each capture.
 Thread 'sync': at start-up, then hourly at hh:04 -> refresh markets, HL + Lighter + RISEx settled funding (gap repair),
-               costs for candidate pairs, 24h-move stats, signals, housekeeping, timing verdict.
+               costs for candidate pairs, 24h-move stats, signals, housekeeping, timing verdict, then a
+               time-boxed sweep of every shared asset's order books for the Volume tab.
 Thread 'dash': read-only dashboard on DASHBOARD_HOST:DASHBOARD_PORT (localhost; open it through the SSH tunnel).
 Watchdog: the process exits (systemd restarts it within seconds) if a thread dies, the Variational loop stalls for
 VAR_STALL_S, or one sync runs longer than SYNC_STALL_S."""
@@ -12,13 +13,15 @@ import signal
 import threading
 import time
 
-from src.config import BACKFILL_DAYS, DASHBOARD_HOST, DASHBOARD_PORT, DB_PATH, VAR_RATE_SOURCE
+from src.config import (BACKFILL_DAYS, DASHBOARD_HOST, DASHBOARD_PORT, DB_PATH, VAR_RATE_SOURCE, VOLUME_SWEEP,
+                        VOLUME_SWEEP_MAX_S)
 from src.costs import refresh_costs, refresh_price_stats
 from src.dashboard import serve
 from src.db import connect
 from src.funding import (capture_variational, derive_variational, housekeeping, ingest_hyperliquid, ingest_lighter,
                          ingest_risex, next_capture_time, record_run, upcoming_settlements)
 from src.matching import refresh_markets
+from src.volume import sweep_markets
 from src.signals import evaluate_all, market_index, prioritized_assets
 from src.var_timing import timing_report
 
@@ -91,6 +94,10 @@ def sync_loop():
             log.info("costs %s price_stats %s signals %s housekeeping %s", cst, pst, sig, hk)
             record_run(conn, "signals", t0, True, {"costs": cst, "price_stats": pst, "signals": sig, "housekeeping": hk})
             log.info("var timing: %s", timing_report(conn))
+            if VOLUME_SWEEP:
+                vol = refresh_costs(conn, sweep_markets(conn, t0), deadline=time.time() + VOLUME_SWEEP_MAX_S)
+                log.info("volume sweep %s took=%ds", vol, int(time.time()) - t0)
+                record_run(conn, "volume_sweep", t0, vol["errors"] == 0, vol)
         except Exception as e:
             log.exception("sync failed")
             record_run(conn, "sync", t0, False, {"error": repr(e)[:300]})

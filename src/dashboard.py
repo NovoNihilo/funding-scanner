@@ -1,8 +1,9 @@
 """Read-only dashboard, rendered from the database on every request.
 Served on localhost only (DASHBOARD_HOST); open it through the SSH tunnel: deploy/dashboard.ps1.
-Routes:  /                 the page (tabs: Opportunities, Watchlist, Markets, Health, Activity)
+Routes:  /                 the page (tabs: Opportunities, Watchlist, Markets, Volume, Health, Activity)
          /api/pair?id=...  JSON for one pair's detail panel (hourly series, legs, costs, flags explained)
-         /api/asset?a=...  JSON for one asset's funding on every venue (Markets tab)"""
+         /api/asset?a=...  JSON for one asset's funding on every venue (Markets tab)
+         /api/volume       JSON for the Volume tab: cheapest delta-neutral round trip per asset at every size"""
 import html
 import json
 import os
@@ -15,10 +16,11 @@ from urllib.parse import parse_qs, urlparse
 
 from src.config import (APY_BASIS, DB_PATH, EMERGING_MIN_H, HOLD_HORIZON_H, KILL_CUSHION_H, KILL_LOSS_SHARE,
                         MAX_LEVERAGE_CAP, MIN_APY_1X, PRIMARY_SIZE, REQUIRED_VENUE, SIGNAL_LOOKBACK_DAYS,
-                        TERMINATE_AFTER, TERMINATE_HARD_AFTER)
+                        TERMINATE_AFTER, TERMINATE_HARD_AFTER, VOLUME_SIZES)
 from src.db import connect
 from src.funding import completeness, upcoming_settlements
 from src.markets import asset_detail, overview
+from src.volume import board, payload
 from src.signals import _load, _normal_interval, build_periods, lifecycle, mark_anomalies, var_hourly
 
 HOUR = 3600
@@ -570,8 +572,10 @@ def build_page(conn, now=None, db_path=None):
           f'aren\'t qualified or emerging yet, with what is holding each one back.</p></div>'
           + pair_table(watch, classes, series, "No other pairs have an APY yet.", with_reasons=True))
     mk = overview(conn, now)
+    vol_n = sum(1 for r in board(conn, VOLUME_SIZES[0], now) if r["best"])
     tabs = [("opportunities", "Opportunities", len(qualified) + len(emerging)), ("watchlist", "Watchlist", len(watch)),
-            ("markets", "Markets", len(mk)), ("health", "Health", None), ("activity", "Activity", None)]
+            ("markets", "Markets", len(mk)), ("volume", "Volume", vol_n), ("health", "Health", None),
+            ("activity", "Activity", None)]
     tablist = "".join(f'<button role="tab" id="t-{k}" aria-controls="tab-{k}" data-tab="{k}" aria-selected="false">'
                       f'{label}{f" <span class=count>{n}</span>" if n is not None else ""}</button>'
                       for k, label, n in tabs)
@@ -595,6 +599,13 @@ def build_page(conn, now=None, db_path=None):
   <div role="tabpanel" id="tab-markets" aria-labelledby="t-markets" hidden><div class="sechead"><h2>Markets</h2>
     <p>Funding on every tracked asset, venue by venue. Rates are the 24h average APR on position notional (above zero,
     longs pay shorts). The spread is the widest gap against Variational, as APY at 1x on capital.</p></div>{markets_tab(mk)}</div>
+  <div role="tabpanel" id="tab-volume" aria-labelledby="t-volume" hidden><div class="sechead"><h2>Volume</h2>
+    <p>The cheapest assets to trade delta neutral right now, funding or not. Each row is the cheapest way to open and
+    close a hedged pair with a Variational leg: both legs' spread, slippage at your size and fees. Cost is shown per
+    $10k of Variational volume (each round trip trades twice the size there).</p></div>
+    <div class="vol-bar"><div class="seg" role="group" aria-label="Size per leg" id="vol-sizes"></div>
+    <p class="muted" id="vol-sweep"></p></div><p class="lead" id="vol-lead"></p>
+    <div id="vol-body"><p class="muted">Loading...</p></div></div>
   <div role="tabpanel" id="tab-health" aria-labelledby="t-health" hidden><div class="sechead"><h2>Health</h2>
     <p>Whether every collector is running and the data is complete.</p></div>{health_tab(h, warming)}</div>
   <div role="tabpanel" id="tab-activity" aria-labelledby="t-activity" hidden><div class="sechead"><h2>Activity</h2>
@@ -774,6 +785,17 @@ details.tbl table{font-size:13px}details.tbl td,details.tbl th{padding:5px 8px}
 .tag{font:600 10.5px/1 "IBM Plex Sans Condensed",sans-serif;padding:2px 4px;border-radius:3px;background:var(--chip);
  color:var(--ink2);margin-left:5px;vertical-align:1px}
 tr.is-sel td{background:var(--rule2)}tr.is-sel td:first-child{box-shadow:inset 3px 0 0 var(--ink)}
+.vol-bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;margin-bottom:14px}.vol-bar p{margin:0;font-size:13px}
+#vol-body.is-loading{opacity:.5}
+.vt td.vb-best{background:var(--rule2)}.vt td.vb-best b{font-weight:600}
+.vt .pairv{display:inline-flex;gap:4px;align-items:center}
+.vt tr.vrow{cursor:pointer}.vt tr.vrow:hover td{background:var(--rule2)}
+.vt tr.vdet td{background:var(--paper);padding:10px 14px 16px}
+.vt tr.vdet table{font-size:13px;background:var(--surface);border:1px solid var(--rule);border-radius:8px}
+.vt tr.vdet th,.vt tr.vdet td.c{padding:6px 10px;background:none}
+.vt .open{text-decoration:none;color:inherit}
+@media (max-width:820px){.vt th:nth-child(3),.vt td:nth-child(3),.vt th:nth-child(4),.vt td:nth-child(4),
+ .vt th:nth-child(5),.vt td:nth-child(5),.vt th:nth-child(9),.vt td:nth-child(9){display:none}}
 @media (max-width:820px){.asset{padding:14px 12px 16px}.mkts th:nth-child(7),.mkts td:nth-child(7){display:none}}
 @media (max-width:820px){.top,.bar,main{padding-left:16px;padding-right:16px}.filters{width:100%}input{flex:1;width:auto}
  .c-trend,.c-net,.c-age,.c-spark{display:none}.d-figs{grid-template-columns:repeat(2,1fr)}.drawer-body{padding:20px 16px 40px}}
@@ -789,7 +811,8 @@ function store(k,v){try{if(v===undefined)return sessionStorage.getItem(k);sessio
 // tabs
 function show(id){var sub=String(id||'').split('/');id=sub[0];if(!$('#tab-'+id))id='opportunities';$$('[role=tab]').forEach(function(t){t.setAttribute('aria-selected',t.dataset.tab===id)});
  $$('[role=tabpanel]').forEach(function(p){p.hidden=p.id!=='tab-'+id});if(location.hash.split('/')[0]!=='#'+id)history.replaceState(null,'','#'+id);
- if(id==='markets'){var a=null;try{a=sub[1]?decodeURIComponent(sub[1]):null}catch(e){}setTimeout(function(){openAsset(a)},0)}}
+ if(id==='markets'){var a=null;try{a=sub[1]?decodeURIComponent(sub[1]):null}catch(e){}setTimeout(function(){openAsset(a)},0)}
+ if(id==='volume')setTimeout(function(){loadVolume()},0)}
 $$('[role=tab]').forEach(function(t){t.onclick=function(){show(t.dataset.tab)}});
 $$('[data-goto]').forEach(function(b){b.onclick=function(){show(b.dataset.goto)}});
 $('[role=tablist]').addEventListener('keydown',function(e){var tabs=$$('[role=tab]'),i=tabs.indexOf(document.activeElement);
@@ -972,9 +995,59 @@ document.addEventListener('click',function(e){
  var sb=e.target.closest('#asset-detail [data-series]');if(sb){var k=sb.dataset.series;MK.hidden[k]=!MK.hidden[k];renderAsset();return}
  var ar=e.target.closest('[data-asset]');if(!ar||e.target.closest('th'))return;openAsset(ar.dataset.asset);
  var box=$('#asset-detail');if(box&&box.getBoundingClientRect().top<0)box.scrollIntoView({behavior:'smooth',block:'start'})});
+// volume tab: cheapest delta-neutral round trips, at every size
+var VOL={data:null,size:+(store('vol_size')||0),sort:null,dir:1,open:{}};
+var VCOLS=[['asset','Asset'],['variational','Variational'],['hyperliquid','Hyperliquid'],['lighter','Lighter'],['risex','RISEx'],
+ ['pair','Cheapest pair'],['per10k','Per $10k Variational volume'],['usd','Round trip'],['funding','Funding, 1 day held']];
+function bpTxt(x){if(x==null)return null;var b=x*1e4;return b.toFixed(b<10?1:0)+' bp'}
+function usdTxt(x,d){return x==null?'n/a':(x<0?'-':'')+'$'+Math.abs(x).toLocaleString([],{minimumFractionDigits:d==null?2:d,maximumFractionDigits:d==null?2:d})}
+function sizeTxt(s){return s>=1000?'$'+(s/1000)+'k':'$'+s}
+function loadVolume(force){var body=$('#vol-body');if(!body)return;if(VOL.data&&!force){renderVolume();return}
+ body.classList.add('is-loading');fetch('/api/volume').then(function(r){return r.json()}).then(function(d){body.classList.remove('is-loading');VOL.data=d;renderVolume()})
+ .catch(function(){body.classList.remove('is-loading');body.innerHTML='<p class="muted">Could not load volume costs. Refresh the page and try again.</p>'})}
+function vcell(a,venue,size,b){var ms=a.venues.filter(function(v){return v.venue===venue});if(!ms.length)return {h:'<span class="muted">&#8211;</span>',v:1e18,best:false};
+ var best=false,v=1e18,h=ms.map(function(m){var rt=m.rt[size],f=m.flags[size]||[],isBest=b&&((b.venue===venue&&b.symbol===m.symbol)||(b.anchor===venue&&b.anchor_symbol===m.symbol));
+  best=best||isBest;if(rt!=null)v=Math.min(v,rt);
+  var note=f.indexOf('NO_DATA')>=0?'no book yet':(f.indexOf('NO_DEPTH')>=0?'book too thin':(f.indexOf('STALE_QUOTES')>=0?'quote over 10 min old':(f.indexOf('AGG_BOOK')>=0?'deep book, approximate':'')));
+  var tag=m.symbol.indexOf(':')>0?'<span class="tag">'+esc(m.symbol.split(':')[0])+'</span>':'';
+  return '<div class="mv">'+(rt==null?'<span class="muted">&#8211;</span>':'<b>'+(f.indexOf('AGG_BOOK')>=0?'&#8776;':'')+bpTxt(rt)+'</b>')+tag+(note?'<span class="sub">'+note+'</span>':'')+'</div>'}).join('');
+ return {h:h,v:v,best:best}}
+function vkey(a,key,size){var b=a.best[size];if(key==='asset')return a.asset;if(key==='pair')return b?b.short:'~';
+ if(['variational','hyperliquid','lighter','risex'].indexOf(key)>=0)return vcell(a,key,size,b).v;
+ if(!b)return 1e18;if(key==='per10k')return b.per10k_var;if(key==='usd')return b.usd;if(key==='funding')return b.funding?-b.funding.daily_usd:1e18;return 0}
+function ladder(a,d){var rows=d.sizes.map(function(s){var b=a.best[s];
+  return '<tr><td class="c">'+sizeTxt(s)+'</td><td class="c">'+(b?'VAR + '+esc(b.short):'<span class="muted">no complete hedge</span>')+'</td><td class="c n">'+(b?usdTxt(b.per10k_var):'')+'</td><td class="c n">'+(b?usdTxt(b.usd):'')+'</td>'
+  +a.venues.map(function(v){var rt=v.rt[s];return '<td class="c n">'+(rt==null?'&#8211;':((v.flags[s]||[]).indexOf('AGG_BOOK')>=0?'&#8776;':'')+bpTxt(rt))+'</td>'}).join('')+'</tr>'}).join('');
+ return '<table><thead><tr><th class="c">Size per leg</th><th class="c">Cheapest pair</th><th class="c n">Per $10k Variational volume</th><th class="c n">Round trip</th>'
+  +a.venues.map(function(v){return '<th class="c n">'+esc(v.short)+' '+esc(v.symbol)+'</th>'}).join('')+'</tr></thead><tbody>'+rows+'</tbody></table>'}
+function renderVolume(){var d=VOL.data;if(!d)return;if(d.sizes.indexOf(VOL.size)<0)VOL.size=d.sizes[0];var size=VOL.size;
+ $('#vol-sizes').innerHTML=d.sizes.map(function(s){return '<button type="button" data-vsize="'+s+'" aria-pressed="'+(s===size)+'">'+sizeTxt(s)+'</button>'}).join('');
+ var sw=d.sweep;$('#vol-sweep').textContent=sw&&sw.finished_at?'Order books refreshed '+local(sw.finished_at)+' ('+sw.markets+' markets'+(sw.skipped?', '+sw.skipped+' left for the next sweep':'')+'). Costs older than 2 hours are left out.':'Order books for every shared asset are refreshed after each hourly update.';
+ var assets=d.assets.slice();
+ if(VOL.sort){assets.sort(function(x,y){var a=vkey(x,VOL.sort,size),b=vkey(y,VOL.sort,size);return (typeof a==='string'?String(a).localeCompare(b):a-b)*VOL.dir})}
+ else assets.sort(function(x,y){var a=x.best[size],b=y.best[size];return (a?a.taker:1e18)-(b?b.taker:1e18)||x.asset.localeCompare(y.asset)});
+ var top=assets.filter(function(a){return a.best[size]}).sort(function(x,y){return x.best[size].taker-y.best[size].taker})[0];
+ $('#vol-lead').innerHTML=top?'Cheapest at '+sizeTxt(size)+' a leg: <b>'+esc(top.asset)+'</b>, '+usdTxt(top.best[size].per10k_var)+' per $10k of Variational volume, hedged on '+esc(top.best[size].short)+'.':'No asset has fresh order books on both legs at this size yet.';
+ var th=VCOLS.map(function(c,i){var n=i>0&&c[0]!=='pair';return '<th scope="col"'+(n?' class="n"':'')+'><button class="sort" data-vcol="'+c[0]+'"'+(VOL.sort===c[0]?' data-dir="'+(VOL.dir>0?'asc':'desc')+'"':'')+'>'+c[1]+'</button></th>'}).join('');
+ var rows=assets.map(function(a){var b=a.best[size],text=(a.asset+' '+a.venues.map(function(v){return v.symbol}).join(' ')).toLowerCase(),attrs=' data-class="'+esc(a.class)+'" data-text="'+esc(text)+'"';
+  var cells=['variational','hyperliquid','lighter','risex'].map(function(v){var c=vcell(a,v,size,b);return '<td class="n'+(c.best?' vb-best':'')+'">'+c.h+'</td>'}).join('');
+  var f=b&&b.funding;
+  var r='<tr class="vrow" data-vasset="'+esc(a.asset)+'"'+attrs+'><td class="c-asset"><a class="open" href="#markets/'+encodeURIComponent(a.asset)+'">'+esc(a.asset)+'</a><span class="sub">'+(a.class==='tradfi'?'RWA':'Crypto')+'</span></td>'+cells
+   +'<td>'+(b?'<span class="pairv"><abbr class="vb vb-var" title="Variational">VAR</abbr>+<abbr class="vb" title="'+esc(b.venue)+'">'+esc(b.short)+'</abbr></span>':'<span class="muted">No complete hedge</span>')+'</td>'
+   +'<td class="n">'+(b?'<b>'+usdTxt(b.per10k_var)+'</b><span class="sub">'+usdTxt(b.per10k_var_maker)+' with a maker hedge</span>':'')+'</td>'
+   +'<td class="n">'+(b?usdTxt(b.usd)+'<span class="sub">'+usdTxt(b.per10k_all)+' per $10k, both venues</span>':'')+'</td>'
+   +'<td class="n">'+(f?(f.daily_usd>=0?'+':'')+usdTxt(f.daily_usd)+'<span class="sub">long '+esc(f.long)+', short '+esc(f.short)+'</span>':'<span class="muted">&#8211;</span>')+'</td></tr>';
+  if(VOL.open[a.asset])r+='<tr class="vdet"'+attrs+'><td colspan="9"><p class="note">Cost by size: spread and slippage grow as each leg walks deeper into the book.</p>'+ladder(a,d)+'</td></tr>';
+  return r}).join('');
+ $('#vol-body').innerHTML=assets.length?'<div class="tablewrap"><table class="pairs vt"><thead><tr>'+th+'</tr></thead><tbody>'+rows+'</tbody></table></div>':'<p class="empty">No shared assets yet.</p>';
+ apply()}
+document.addEventListener('click',function(e){
+ var sb=e.target.closest('[data-vsize]');if(sb){VOL.size=+sb.dataset.vsize;store('vol_size',String(VOL.size));renderVolume();return}
+ var hc=e.target.closest('[data-vcol]');if(hc){var k=hc.dataset.vcol;VOL.dir=VOL.sort===k?-VOL.dir:1;VOL.sort=k;renderVolume();return}
+ var vr=e.target.closest('tr.vrow');if(vr&&!e.target.closest('a')){var a=vr.dataset.vasset;VOL.open[a]=!VOL.open[a];renderVolume()}});
 var mkResize=null;window.addEventListener('resize',function(){clearTimeout(mkResize);mkResize=setTimeout(function(){if(MK.data&&!$('#tab-markets').hidden)renderAsset()},150)});
 // refresh every 5 minutes unless the detail panel is open or the filter has focus
-setInterval(function(){if(!drawer.classList.contains('is-open')&&document.activeElement!==q)location.reload()},300000);
+setInterval(function(){if(!drawer.classList.contains('is-open')&&document.activeElement!==q&&!Object.keys(VOL.open).some(function(k){return VOL.open[k]}))location.reload()},300000);
 })();
 </script></body></html>""".replace("__SZ__", SZ)
 
@@ -999,6 +1072,8 @@ class _Handler(BaseHTTPRequestHandler):
             conn = connect(self.server.db_path)  # one connection per request: requests run on their own threads
             if url.path in ("/", "/index.html"):
                 self._send(200, build_page(conn, db_path=self.server.db_path).encode(), "text/html; charset=utf-8")
+            elif url.path == "/api/volume":
+                self._send(200, json.dumps(payload(conn)).encode(), "application/json")
             elif url.path == "/api/asset":
                 a = (parse_qs(url.query).get("a") or [""])[0]
                 d = asset_detail(conn, a)

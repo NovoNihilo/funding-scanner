@@ -27,9 +27,13 @@ def funding_history(coin, start_ms, end_ms=None):
     return _post(body)
 
 
-def l2_book(coin):
-    """Return (bids, asks) as [(price, size_in_contract_units)], best first."""
-    data = _post({"type": "l2Book", "coin": coin})
+def l2_book(coin, n_sig_figs=None):
+    """Return (bids, asks) as [(price, size_in_contract_units)], best first. The venue sends 20 levels a side;
+    n_sig_figs (2-5) groups prices into coarser buckets so the 20 levels reach deeper into the book."""
+    body = {"type": "l2Book", "coin": coin}
+    if n_sig_figs:
+        body["nSigFigs"] = n_sig_figs
+    data = _post(body)
     bids, asks = data["levels"]
     return ([(float(x["px"]), float(x["sz"])) for x in bids], [(float(x["px"]), float(x["sz"])) for x in asks])
 
