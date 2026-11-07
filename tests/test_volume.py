@@ -111,3 +111,22 @@ def test_page_has_volume_tab_and_api(db, tmp_path):
     finally:
         stop.set()
         t.join(timeout=5)
+
+
+def test_maker_ranking_can_pick_a_different_hedge(db, monkeypatch):
+    monkeypatch.setattr(volume, "VOLUME_SIZES", [1000.0, 100000.0])
+    _cost(db, "lighter", "AAA", 1000, 6e-4, maker=5e-4)         # Lighter: tight spread, high maker fee
+    _cost(db, "hyperliquid", "AAA", 1000, 10e-4, maker=0.0)     # Hyperliquid: wide spread, free maker
+    rows = {r["asset"]: r for r in volume.board(db, 1000, NOW)}
+    t, m = rows["AAA"]["best"], rows["AAA"]["best_maker"]
+    assert t["venue"] == "lighter" and abs(t["taker"] - 10e-4) < 1e-12        # 4 + 6 bp
+    assert m["venue"] == "hyperliquid" and abs(m["maker"] - 4e-4) < 1e-12     # 4 bp VAR (always taker) + 0
+    assert abs(m["per10k_var_maker"] - 2.0) < 1e-9 and abs(m["usd_maker"] - 0.4) < 1e-9
+    d = volume.payload(db, NOW)
+    aaa = next(a for a in d["assets"] if a["asset"] == "AAA")
+    assert aaa["best"][1000]["venue"] == "lighter" and aaa["best_maker"][1000]["venue"] == "hyperliquid"
+
+
+def test_page_has_execution_style_toggle(db):
+    page = build_page(db, now=NOW, db_path=":memory:")
+    assert 'id="vol-style"' in page and "data-vstyle" in page and "best_maker" in page

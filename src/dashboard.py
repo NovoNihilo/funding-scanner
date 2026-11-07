@@ -416,7 +416,7 @@ def pair_rows(rows, classes, series, with_reasons):
 def pair_table(rows, classes, series, empty, with_reasons=False):
     if not rows:
         return f'<p class="empty">{empty}</p>'
-    heads = ["Asset", "Trade", "APY at 1x", "Trend (12h vs 24h)", "Payback of entry + exit", f"Net {HOLD_HORIZON_H / 24:.0f}d",
+    heads = ["Asset", "Trade", "APY at 1x", "Trend (12h vs 24h)", "Payback of entry + exit", f"Net {HOLD_HORIZON_H / 24:.0f}d, taker",
              "Run age", f"Last {SPARK_H}h"] + (["Why not yet"] if with_reasons else [])
     cls = ["c-asset", "c-trade", "c-apy n", "c-trend", "c-pay n", "c-net n", "c-age n", "c-spark"] + \
           (["c-why"] if with_reasons else [])
@@ -587,7 +587,7 @@ def build_page(conn, now=None, db_path=None):
     opp = (f'<p class="lead">{lead}</p>'
            f'<section aria-labelledby="h-q"><div class="sechead"><h2 id="h-q">Qualified</h2><p>Profitable for 24 hours or '
            f'more and passing every check. Ranked by expected net over {HOLD_HORIZON_H / 24:.0f} days at '
-           f'${PRIMARY_SIZE:,.0f} per leg after taker costs.</p></div>'
+           f'${PRIMARY_SIZE:,.0f} per leg after taker costs. Payback shows maker (best case) and taker (worst case).</p></div>'
            + pair_table(qualified, classes, series, "No qualified pairs right now.") + '</section>'
            f'<section aria-labelledby="h-e"><div class="sechead"><h2 id="h-e">Emerging</h2><p>Profitable for 8 to 24 '
            f'hours and passing the same checks on the run so far. Early numbers move more; consider a smaller size.'
@@ -627,9 +627,12 @@ def build_page(conn, now=None, db_path=None):
   <div role="tabpanel" id="tab-volume" aria-labelledby="t-volume" hidden><div class="sechead"><h2>Volume</h2>
     <p>The cheapest assets to trade delta neutral right now, funding or not. Each row is the cheapest way to open and
     close a hedged pair with a Variational leg: both legs' spread, slippage at your size and fees. Cost is shown per
-    $10k of Variational volume (each round trip trades twice the size there).</p></div>
+    $10k of Variational volume (each round trip trades twice the size there). That is a rate for trading in clips of
+    the size you pick, so it changes with the size: bigger orders walk deeper into the book and pay more per dollar.
+    At $1k a leg, $10k of Variational volume takes 5 round trips; at $100k a leg, one round trip makes $200k.</p></div>
     <div class="vol-bar"><div class="seg" role="group" aria-label="Size per leg" id="vol-sizes"></div>
-    <p class="muted" id="vol-sweep"></p></div><p class="lead" id="vol-lead"></p>
+    <div class="seg" role="group" aria-label="Execution style" id="vol-style"></div>
+    <p class="muted" id="vol-sweep"></p></div><p class="note" id="vol-style-note"></p><p class="lead" id="vol-lead"></p>
     <div id="vol-body"><p class="muted">Loading...</p></div></div>
   <div role="tabpanel" id="tab-health" aria-labelledby="t-health" hidden><div class="sechead"><h2>Health</h2>
     <p>Whether every collector is running and the data is complete.</p></div>{health_tab(h, warming)}</div>
@@ -1021,7 +1024,7 @@ document.addEventListener('click',function(e){
  var ar=e.target.closest('[data-asset]');if(!ar||e.target.closest('th'))return;openAsset(ar.dataset.asset);
  var box=$('#asset-detail');if(box&&box.getBoundingClientRect().top<0)box.scrollIntoView({behavior:'smooth',block:'start'})});
 // volume tab: cheapest delta-neutral round trips, at every size
-var VOL={data:null,size:+(store('vol_size')||0),sort:null,dir:1,open:{},hist:{}};
+var VOL={data:null,size:+(store('vol_size')||0),style:store('vol_style')==='maker'?'maker':'taker',sort:null,dir:1,open:{},hist:{}};
 function bpFmt(v){return (Math.abs(v)<10?v.toFixed(1):v.toFixed(0))+' bp'}
 function drawHist(){var size=VOL.size;$$('#vol-body [data-hist]').forEach(function(el){var a=el.dataset.hist,k=a+'|'+size,h=VOL.hist[k];
  if(h===undefined){VOL.hist[k]=null;fetch('/api/volume/history?a='+encodeURIComponent(a)+'&size='+size).then(function(r){return r.json()})
@@ -1032,51 +1035,60 @@ function drawHist(){var size=VOL.size;$$('#vol-body [data-hist]').forEach(functi
  lineChart(el,h.series,{lo:Math.max(h.now-14*86400,first-3600),hi:h.now,f:1e4,fmt:bpFmt,label:'Round-trip cost of '+a+' by venue, in basis points'})})}
 var VCOLS=[['asset','Asset'],['variational','Variational'],['hyperliquid','Hyperliquid'],['lighter','Lighter'],['risex','RISEx'],
  ['pair','Cheapest pair'],['per10k','Per $10k Variational volume'],['usd','Round trip'],['funding','Funding, 1 day held']];
+function rtsTxt(s){var n=1e4/(2*s);return n>=1?(n===1?'1 round trip':n.toLocaleString([],{maximumFractionDigits:1})+' round trips')+' of '+sizeTxt(s)+' a leg':'one '+sizeTxt(s)+' round trip makes '+usdTxt(2*s,0)}
 function bpTxt(x){if(x==null)return null;var b=x*1e4;return b.toFixed(b<10?1:0)+' bp'}
 function usdTxt(x,d){return x==null?'n/a':(x<0?'-':'')+'$'+Math.abs(x).toLocaleString([],{minimumFractionDigits:d==null?2:d,maximumFractionDigits:d==null?2:d})}
 function sizeTxt(s){return s>=1000?'$'+(s/1000)+'k':'$'+s}
 function loadVolume(force){var body=$('#vol-body');if(!body)return;if(VOL.data&&!force){renderVolume();return}
  body.classList.add('is-loading');fetch('/api/volume').then(function(r){return r.json()}).then(function(d){body.classList.remove('is-loading');VOL.data=d;renderVolume()})
  .catch(function(){body.classList.remove('is-loading');body.innerHTML='<p class="muted">Could not load volume costs. Refresh the page and try again.</p>'})}
+function maker(){return VOL.style==='maker'}
+function bestOf(a,size){return (maker()?a.best_maker:a.best)[size]}
 function vcell(a,venue,size,b){var ms=a.venues.filter(function(v){return v.venue===venue});if(!ms.length)return {h:'<span class="muted">&#8211;</span>',v:1e18,best:false};
- var best=false,v=1e18,h=ms.map(function(m){var rt=m.rt[size],f=m.flags[size]||[],isBest=b&&((b.venue===venue&&b.symbol===m.symbol)||(b.anchor===venue&&b.anchor_symbol===m.symbol));
+ var best=false,v=1e18,h=ms.map(function(m){var useMk=maker()&&venue!=='variational',rt=useMk?m.maker[size]:m.rt[size],f=m.flags[size]||[],isBest=b&&((b.venue===venue&&b.symbol===m.symbol)||(b.anchor===venue&&b.anchor_symbol===m.symbol));
   best=best||isBest;if(rt!=null)v=Math.min(v,rt);
-  var note=f.indexOf('NO_DATA')>=0?'no book yet':(f.indexOf('NO_DEPTH')>=0?'book too thin':(f.indexOf('STALE_QUOTES')>=0?'quote over 10 min old':(f.indexOf('AGG_BOOK')>=0?'deep book, approximate':'')));
+  var note=f.indexOf('NO_DATA')>=0?'no book yet':(f.indexOf('NO_DEPTH')>=0?'book too thin':(useMk?'maker fees, if filled':(f.indexOf('STALE_QUOTES')>=0?'quote over 10 min old':(f.indexOf('AGG_BOOK')>=0?'deep book, approximate':(maker()&&venue==='variational'?'quotes only, always taker':'')))));
   var tag=m.symbol.indexOf(':')>0?'<span class="tag">'+esc(m.symbol.split(':')[0])+'</span>':'';
-  return '<div class="mv">'+(rt==null?'<span class="muted">&#8211;</span>':'<b>'+(f.indexOf('AGG_BOOK')>=0?'&#8776;':'')+bpTxt(rt)+'</b>')+tag+(note?'<span class="sub">'+note+'</span>':'')+'</div>'}).join('');
+  return '<div class="mv">'+(rt==null?'<span class="muted">&#8211;</span>':'<b>'+(!useMk&&f.indexOf('AGG_BOOK')>=0?'&#8776;':'')+bpTxt(rt)+'</b>')+tag+(note?'<span class="sub">'+note+'</span>':'')+'</div>'}).join('');
  return {h:h,v:v,best:best}}
-function vkey(a,key,size){var b=a.best[size];if(key==='asset')return a.asset;if(key==='pair')return b?b.short:'~';
+function vkey(a,key,size){var b=bestOf(a,size),mk=maker();if(key==='asset')return a.asset;if(key==='pair')return b?b.short:'~';
  if(['variational','hyperliquid','lighter','risex'].indexOf(key)>=0)return vcell(a,key,size,b).v;
- if(!b)return 1e18;if(key==='per10k')return b.per10k_var;if(key==='usd')return b.usd;if(key==='funding')return b.funding?-b.funding.daily_usd:1e18;return 0}
-function ladder(a,d){var rows=d.sizes.map(function(s){var b=a.best[s];
-  return '<tr><td class="c">'+sizeTxt(s)+'</td><td class="c">'+(b?'VAR + '+esc(b.short):'<span class="muted">no complete hedge</span>')+'</td><td class="c n">'+(b?usdTxt(b.per10k_var):'')+'</td><td class="c n">'+(b?usdTxt(b.usd):'')+'</td>'
-  +a.venues.map(function(v){var rt=v.rt[s];return '<td class="c n">'+(rt==null?'&#8211;':((v.flags[s]||[]).indexOf('AGG_BOOK')>=0?'&#8776;':'')+bpTxt(rt))+'</td>'}).join('')+'</tr>'}).join('');
- return '<table><thead><tr><th class="c">Size per leg</th><th class="c">Cheapest pair</th><th class="c n">Per $10k Variational volume</th><th class="c n">Round trip</th>'
-  +a.venues.map(function(v){return '<th class="c n">'+esc(v.short)+' '+esc(v.symbol)+'</th>'}).join('')+'</tr></thead><tbody>'+rows+'</tbody></table>'}
-function renderVolume(){var d=VOL.data;if(!d)return;if(d.sizes.indexOf(VOL.size)<0)VOL.size=d.sizes[0];var size=VOL.size;
+ if(!b)return 1e18;if(key==='per10k')return mk?b.per10k_var_maker:b.per10k_var;if(key==='usd')return mk?b.usd_maker:b.usd;if(key==='funding')return b.funding?-b.funding.daily_usd:1e18;return 0}
+function ladder(a,d){var rows=d.sizes.map(function(s){var t=a.best[s],m=a.best_maker[s];
+  return '<tr><td class="c">'+sizeTxt(s)+'</td><td class="c n">'+(t?usdTxt(t.per10k_var)+' <span class="muted">VAR + '+esc(t.short)+'</span>':'<span class="muted">no complete hedge</span>')+'</td>'
+  +'<td class="c n">'+(m?usdTxt(m.per10k_var_maker)+' <span class="muted">VAR + '+esc(m.short)+'</span>':'')+'</td>'
+  +a.venues.map(function(v){var rt=v.rt[s],mk=v.maker[s],agg=(v.flags[s]||[]).indexOf('AGG_BOOK')>=0;
+   return '<td class="c n">'+(rt==null?'&#8211;':(agg?'&#8776;':'')+bpTxt(rt)+(v.venue!=='variational'&&mk!=null?' <span class="muted">/ '+bpTxt(mk)+'</span>':''))+'</td>'}).join('')+'</tr>'}).join('');
+ return '<table><thead><tr><th class="c">Size per leg</th><th class="c n">Taker, per $10k Variational volume</th><th class="c n">Maker hedge, per $10k Variational volume</th>'
+  +a.venues.map(function(v){return '<th class="c n">'+esc(v.short)+' '+esc(v.symbol)+(v.venue!=='variational'?' <span class="muted">taker / maker</span>':'')+'</th>'}).join('')+'</tr></thead><tbody>'+rows+'</tbody></table>'}
+function renderVolume(){var d=VOL.data;if(!d)return;if(d.sizes.indexOf(VOL.size)<0)VOL.size=d.sizes[0];var size=VOL.size,mk=maker();
  $('#vol-sizes').innerHTML=d.sizes.map(function(s){return '<button type="button" data-vsize="'+s+'" aria-pressed="'+(s===size)+'">'+sizeTxt(s)+'</button>'}).join('');
- var sw=d.sweep;$('#vol-sweep').textContent=sw&&sw.finished_at?'Order books refreshed '+local(sw.finished_at)+' ('+sw.markets+' markets'+(sw.skipped?', '+sw.skipped+' left for the next sweep':'')+'). Costs older than 2 hours are left out.':'Order books for every shared asset are refreshed after each hourly update.';
- var assets=d.assets.slice();
+ $('#vol-style').innerHTML=[['taker','Taker'],['maker','Maker hedge']].map(function(x){return '<button type="button" data-vstyle="'+x[0]+'" aria-pressed="'+(VOL.style===x[0])+'">'+x[1]+'</button>'}).join('');
+ $('#vol-style-note').textContent=mk?'Maker hedge: the hedge leg rests limit orders at the best bid or ask and pays only its venue\\'s maker fee, if the orders fill (large orders fill less reliably, and maker costs here do not grow with size). Variational quotes are always taken, so its leg stays at taker cost.'
+  :'Taker: both legs trade immediately against the book, paying the spread, slippage at your size and taker fees. This is the cost you can count on.';
+ var sw=d.sweep;$('#vol-sweep').textContent=sw&&sw.finished_at?(sw.markets?'Order books refreshed '+local(sw.finished_at)+' ('+sw.markets+' markets'+(sw.skipped?', '+sw.skipped+' left for the next sweep':'')+').':'Order books checked '+local(sw.finished_at)+': all were already fresh.')+' Costs older than 2 hours are left out.':'Order books for every shared asset are refreshed every 10 minutes.';
+ var assets=d.assets.slice(),cost=function(a){var b=bestOf(a,size);return b?(mk?b.maker:b.taker):1e18};
  if(VOL.sort){assets.sort(function(x,y){var a=vkey(x,VOL.sort,size),b=vkey(y,VOL.sort,size);return (typeof a==='string'?String(a).localeCompare(b):a-b)*VOL.dir})}
- else assets.sort(function(x,y){var a=x.best[size],b=y.best[size];return (a?a.taker:1e18)-(b?b.taker:1e18)||x.asset.localeCompare(y.asset)});
- var top=assets.filter(function(a){return a.best[size]}).sort(function(x,y){return x.best[size].taker-y.best[size].taker})[0];
- $('#vol-lead').innerHTML=top?'Cheapest at '+sizeTxt(size)+' a leg: <b>'+esc(top.asset)+'</b>, '+usdTxt(top.best[size].per10k_var)+' per $10k of Variational volume, hedged on '+esc(top.best[size].short)+'.':'No asset has fresh order books on both legs at this size yet.';
- var th=VCOLS.map(function(c,i){var n=i>0&&c[0]!=='pair';return '<th scope="col"'+(n?' class="n"':'')+'><button class="sort" data-vcol="'+c[0]+'"'+(VOL.sort===c[0]?' data-dir="'+(VOL.dir>0?'asc':'desc')+'"':'')+'>'+c[1]+'</button></th>'}).join('');
- var rows=assets.map(function(a){var b=a.best[size],text=(a.asset+' '+a.venues.map(function(v){return v.symbol}).join(' ')).toLowerCase(),attrs=' data-class="'+esc(a.class)+'" data-text="'+esc(text)+'"';
+ else assets.sort(function(x,y){return cost(x)-cost(y)||x.asset.localeCompare(y.asset)});
+ var top=assets.filter(function(a){return bestOf(a,size)}).sort(function(x,y){return cost(x)-cost(y)})[0],tb=top&&bestOf(top,size);
+ $('#vol-lead').innerHTML=top?'Cheapest at '+sizeTxt(size)+' a leg, '+(mk?'with a maker hedge':'taking both legs')+': <b>'+esc(top.asset)+'</b>, '+usdTxt(mk?tb.per10k_var_maker:tb.per10k_var)+' per $10k of Variational volume ('+rtsTxt(size)+'), hedged on '+esc(tb.short)+'.':'No asset has fresh order books on both legs at this size yet.';
+ var th=VCOLS.map(function(c,i){var n=i>0&&c[0]!=='pair';return '<th scope="col"'+(n?' class="n"':'')+'><button class="sort" data-vcol="'+c[0]+'"'+(VOL.sort===c[0]?' data-dir="'+(VOL.dir>0?'asc':'desc')+'"':'')+'>'+(c[0]==='per10k'?c[1]+', '+sizeTxt(size)+' trades':c[1])+'</button></th>'}).join('');
+ var rows=assets.map(function(a){var b=bestOf(a,size),text=(a.asset+' '+a.venues.map(function(v){return v.symbol}).join(' ')).toLowerCase(),attrs=' data-class="'+esc(a.class)+'" data-text="'+esc(text)+'"';
   var cells=['variational','hyperliquid','lighter','risex'].map(function(v){var c=vcell(a,v,size,b);return '<td class="n'+(c.best?' vb-best':'')+'">'+c.h+'</td>'}).join('');
-  var f=b&&b.funding;
+  var f=b&&b.funding,o=mk?a.best[size]:a.best_maker[size];
   var r='<tr class="vrow" data-vasset="'+esc(a.asset)+'"'+attrs+'><td class="c-asset"><a class="open" href="#markets/'+encodeURIComponent(a.asset)+'">'+esc(a.asset)+'</a><span class="sub">'+(a.class==='tradfi'?'RWA':'Crypto')+'</span></td>'+cells
    +'<td>'+(b?'<span class="pairv"><abbr class="vb vb-var" title="Variational">VAR</abbr>+<abbr class="vb" title="'+esc(b.venue)+'">'+esc(b.short)+'</abbr></span>':'<span class="muted">No complete hedge</span>')+'</td>'
-   +'<td class="n">'+(b?'<b>'+usdTxt(b.per10k_var)+'</b><span class="sub">'+usdTxt(b.per10k_var_maker)+' with a maker hedge</span>':'')+'</td>'
-   +'<td class="n">'+(b?usdTxt(b.usd)+'<span class="sub">'+usdTxt(b.per10k_all)+' per $10k, both venues</span>':'')+'</td>'
+   +'<td class="n">'+(b?'<b>'+usdTxt(mk?b.per10k_var_maker:b.per10k_var)+'</b><span class="sub">'+(o?(mk?'taker: ':'maker hedge: ')+usdTxt(mk?o.per10k_var:o.per10k_var_maker)+' (VAR + '+esc(o.short)+')':'')+'</span>':'')+'</td>'
+   +'<td class="n">'+(b?usdTxt(mk?b.usd_maker:b.usd)+'<span class="sub">'+usdTxt(mk?b.per10k_all_maker:b.per10k_all)+' per $10k, both venues</span>':'')+'</td>'
    +'<td class="n">'+(f?(f.daily_usd>=0?'+':'')+usdTxt(f.daily_usd)+'<span class="sub">long '+esc(f.long)+', short '+esc(f.short)+'</span>':'<span class="muted">&#8211;</span>')+'</td></tr>';
-  if(VOL.open[a.asset])r+='<tr class="vdet"'+attrs+'><td colspan="9"><div class="a-ct"><h4>Round-trip cost at '+sizeTxt(size)+' a leg, by venue</h4><span class="muted">Hourly, up to 14 days. Lower is cheaper.</span></div>'
-   +'<div class="chart" data-hist="'+esc(a.asset)+'"></div><p class="note" style="margin-top:14px">Cost by size right now: spread and slippage grow as each leg walks deeper into the book.</p>'+ladder(a,d)+'</td></tr>';
+  if(VOL.open[a.asset])r+='<tr class="vdet"'+attrs+'><td colspan="9"><div class="a-ct"><h4>Taker round-trip cost at '+sizeTxt(size)+' a leg, by venue</h4><span class="muted">Hourly, up to 14 days. Lower is cheaper. Maker costs are fixed fees, so only taker costs are charted.</span></div>'
+   +'<div class="chart" data-hist="'+esc(a.asset)+'"></div><p class="note" style="margin-top:14px">Cost by size right now, taker and maker side by side. Taker grows with size as each leg walks deeper into the book; maker is the venue\\'s fee only.</p>'+ladder(a,d)+'</td></tr>';
   return r}).join('');
  $('#vol-body').innerHTML=assets.length?'<div class="tablewrap"><table class="pairs vt"><thead><tr>'+th+'</tr></thead><tbody>'+rows+'</tbody></table></div>':'<p class="empty">No shared assets yet.</p>';
  apply();drawHist()}
 document.addEventListener('click',function(e){
  var sb=e.target.closest('[data-vsize]');if(sb){VOL.size=+sb.dataset.vsize;store('vol_size',String(VOL.size));renderVolume();return}
+ var st=e.target.closest('[data-vstyle]');if(st){VOL.style=st.dataset.vstyle;store('vol_style',VOL.style);renderVolume();return}
  var hc=e.target.closest('[data-vcol]');if(hc){var k=hc.dataset.vcol;VOL.dir=VOL.sort===k?-VOL.dir:1;VOL.sort=k;renderVolume();return}
  var vr=e.target.closest('tr.vrow');if(vr&&!e.target.closest('a')){var a=vr.dataset.vasset;VOL.open[a]=!VOL.open[a];renderVolume()}});
 var mkResize=null;window.addEventListener('resize',function(){clearTimeout(mkResize);mkResize=setTimeout(function(){if(MK.data&&!$('#tab-markets').hidden)renderAsset()},150)});

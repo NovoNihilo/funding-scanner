@@ -5,6 +5,9 @@ A round trip = open long on one venue + short on the other, then close both. Its
 round-trip costs (spread + slippage + fees, from book_costs). Entry basis is NOT counted: a quick round trip
 closes at roughly the same cross-venue basis it opened at. Cost is quoted per $10k of Variational volume
 (each round trip trades 2 x size on Variational) and per $10k of total volume across both venues (4 x size).
+Two execution styles, each with its own cheapest hedge (the cheapest venue can differ: maker fees vary far more
+than spreads): taker = both legs cross the spread (spread + slippage + taker fees); maker = the hedge leg rests limit
+orders at the touch and pays only maker fees if filled. Variational is RFQ-only, so its leg is always taker.
 Funding is shown alongside, for the better direction, as what holding the hedge for a day would earn or pay.
 History: the last refresh of every hour is kept per market (cost_history, COST_HISTORY_KEEP_DAYS) for charts."""
 import json
@@ -85,7 +88,7 @@ def board(conn, size, now=None):
                 "maker": c["rt_cost_maker"] if c is not None else None,
                 "age": now - c["captured_at"] if c is not None else None,
                 "flags": _flags(c) if c is not None else ["NO_DATA"]})
-        best = None
+        cands = []
         for a in anchors:
             ac = next(x for x in venues[a["venue"]] if x["symbol"] == a["symbol"])
             if ac["rt"] is None:
@@ -97,8 +100,6 @@ def board(conn, size, now=None):
                 if oc["rt"] is None:
                     continue
                 taker = ac["rt"] + oc["rt"]
-                if best is not None and taker >= best["taker"]:
-                    continue
                 maker = ac["rt"] + (oc["maker"] if oc["maker"] is not None else oc["rt"])
                 pa = f"{asset}|{a['venue']}:{a['symbol']}>{o['venue']}:{o['symbol']}"
                 pb = f"{asset}|{o['venue']}:{o['symbol']}>{a['venue']}:{a['symbol']}"
@@ -115,14 +116,17 @@ def board(conn, size, now=None):
                             "long": SHORT.get(a["venue"] if long_a else o["venue"]),
                             "short": SHORT.get(o["venue"] if long_a else a["venue"]),
                             "pair_id": pa if long_a else pb}
-                best = {"anchor": a["venue"], "anchor_symbol": a["symbol"], "venue": o["venue"],
-                        "symbol": o["symbol"], "short": oc["short"], "taker": taker, "maker": maker,
-                        "per10k_var": taker / 2 * PER, "per10k_var_maker": maker / 2 * PER,
-                        "per10k_all": taker / 4 * PER, "usd": taker * size, "funding": fdir,
-                        "var_flags": ac["flags"], "hedge_flags": oc["flags"]}
+                cands.append({"anchor": a["venue"], "anchor_symbol": a["symbol"], "venue": o["venue"],
+                              "symbol": o["symbol"], "short": oc["short"], "taker": taker, "maker": maker,
+                              "per10k_var": taker / 2 * PER, "per10k_var_maker": maker / 2 * PER,
+                              "per10k_all": taker / 4 * PER, "per10k_all_maker": maker / 4 * PER,
+                              "usd": taker * size, "usd_maker": maker * size, "funding": fdir,
+                              "var_flags": ac["flags"], "hedge_flags": oc["flags"]})
+        best = min(cands, key=lambda c: (c["taker"], c["maker"])) if cands else None
+        best_maker = min(cands, key=lambda c: (c["maker"], c["taker"])) if cands else None
         lev = [m["max_leverage"] for m in ms if m["max_leverage"]]
         rows.append({"asset": asset, "class": max((m["asset_class"] or "") for m in ms) or "unknown",
-                     "venues": venues, "best": best, "max_lev": min(lev) if lev else None})
+                     "venues": venues, "best": best, "best_maker": best_maker, "max_lev": min(lev) if lev else None})
     rows.sort(key=lambda r: (r["best"] is None, r["best"]["taker"] if r["best"] else 0, r["asset"]))
     return rows
 
@@ -134,7 +138,8 @@ def _r(x):
 def payload(conn, now=None):
     """Everything the Volume tab shows, for every VOLUME_SIZES entry, merged per asset (sorted by the smallest
     size's cheapest round trip): venues [{venue, symbol, short, rt: {size: cost}, maker, flags, age}],
-    best {size: cheapest hedge}, plus the last sweep's stats."""
+    best {size: cheapest hedge, taker}, best_maker {size: cheapest hedge with a maker hedge leg},
+    plus the last sweep's stats."""
     now = int(now or time.time())
     sizes = [int(s) for s in VOLUME_SIZES]
     assets, order = {}, []
@@ -143,7 +148,7 @@ def payload(conn, now=None):
             a = assets.get(row["asset"])
             if a is None:
                 a = assets[row["asset"]] = {"asset": row["asset"], "class": row["class"], "max_lev": row["max_lev"],
-                                            "venues": {}, "best": {}}
+                                            "venues": {}, "best": {}, "best_maker": {}}
                 order.append(row["asset"])
             for venue, lst in row["venues"].items():
                 for x in lst:
@@ -151,12 +156,13 @@ def payload(conn, now=None):
                         "venue": venue, "symbol": x["symbol"], "short": x["short"], "rt": {}, "maker": {},
                         "flags": {}, "age": x["age"]})
                     v["rt"][size], v["maker"][size], v["flags"][size] = _r(x["rt"]), _r(x["maker"]), x["flags"]
-            b = row["best"]
-            if b is not None:
-                a["best"][size] = {k: (_r(v) if isinstance(v, float) else v) for k, v in b.items()}
-                if b["funding"]:
-                    a["best"][size]["funding"] = {k: (_r(v) if isinstance(v, float) else v)
-                                                  for k, v in b["funding"].items()}
+            for style in ("best", "best_maker"):
+                b = row[style]
+                if b is not None:
+                    a[style][size] = {k: (_r(v) if isinstance(v, float) else v) for k, v in b.items()}
+                    if b["funding"]:
+                        a[style][size]["funding"] = {k: (_r(v) if isinstance(v, float) else v)
+                                                     for k, v in b["funding"].items()}
     out = []
     for name in order:
         a = assets[name]
