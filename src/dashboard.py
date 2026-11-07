@@ -3,7 +3,8 @@ Served on localhost only (DASHBOARD_HOST); open it through the SSH tunnel: deplo
 Routes:  /                 the page (tabs: Opportunities, Watchlist, Markets, Volume, Health, Activity)
          /api/pair?id=...  JSON for one pair's detail panel (hourly series, legs, costs, flags explained)
          /api/asset?a=...  JSON for one asset's funding on every venue (Markets tab)
-         /api/volume       JSON for the Volume tab: cheapest delta-neutral round trip per asset at every size"""
+         /api/volume       JSON for the Volume tab: cheapest delta-neutral round trip per asset at every size
+         /api/volume/history?a=...&size=...  hourly round-trip cost of one asset's markets (Volume tab chart)"""
 import html
 import json
 import os
@@ -16,11 +17,11 @@ from urllib.parse import parse_qs, urlparse
 
 from src.config import (APY_BASIS, DB_PATH, EMERGING_MIN_H, HOLD_HORIZON_H, KILL_CUSHION_H, KILL_LOSS_SHARE,
                         MAX_LEVERAGE_CAP, MIN_APY_1X, PRIMARY_SIZE, REQUIRED_VENUE, SIGNAL_LOOKBACK_DAYS,
-                        TERMINATE_AFTER, TERMINATE_HARD_AFTER, VOLUME_SIZES)
+                        TERMINATE_AFTER, TERMINATE_HARD_AFTER, VOLUME_SIZES, VOLUME_SWEEP)
 from src.db import connect
 from src.funding import completeness, upcoming_settlements
 from src.markets import asset_detail, overview
-from src.volume import board, payload
+from src.volume import board, history, payload
 from src.signals import _load, _normal_interval, build_periods, lifecycle, mark_anomalies, var_hourly
 
 HOUR = 3600
@@ -92,6 +93,22 @@ def _last_run(conn, job):
     return conn.execute("SELECT * FROM runs WHERE job=? ORDER BY id DESC LIMIT 1", (job,)).fetchone()
 
 
+def restart_counts(conn, now):
+    """(planned, unexpected) worker starts in the last 24h. A start right after a recorded clean stop is a deploy;
+    any other start followed a crash or a watchdog exit."""
+    planned = unexpected = 0
+    prev = None
+    for job, t in conn.execute("SELECT job, started_at FROM runs WHERE job IN ('worker_start', 'worker_stop') "
+                               "ORDER BY id"):
+        if job == "worker_start" and prev is not None and t > now - 86400:
+            if prev == "worker_stop":
+                planned += 1
+            else:
+                unexpected += 1
+        prev = job
+    return planned, unexpected
+
+
 def health(conn, now, db_path=None):
     """Overall status (OK / WARN / FAIL), the issues behind it, and the numbers the page shows."""
     issues = []
@@ -124,9 +141,14 @@ def health(conn, now, db_path=None):
         if stale:
             issues.append(("WARN", f"{len(stale)} {venue} market(s) have no settlement for 3h+"))
     starts = [r[0] for r in conn.execute("SELECT started_at FROM runs WHERE job='worker_start' ORDER BY id DESC")]
-    restarts_24h = sum(1 for t in starts if t > now - 86400)
-    if restarts_24h > 5:
-        issues.append(("WARN", f"worker restarted {restarts_24h} times in 24h"))
+    restarts_24h = restart_counts(conn, now)
+    if restarts_24h[1] >= 3:
+        issues.append(("WARN", f"worker restarted unexpectedly {restarts_24h[1]} times in 24h"))
+    elif restarts_24h[1]:
+        issues.append(("INFO", f"worker restarted unexpectedly {restarts_24h[1]} time(s) in 24h (deploys don't count)"))
+    books = _last_run(conn, "books")
+    if VOLUME_SWEEP and books is not None and now - books["finished_at"] > HOUR:
+        issues.append(("WARN", f"Volume tab order books not refreshed for {age(now - books['finished_at'])}"))
     path = db_path or DB_PATH
     db_bytes = sum(os.path.getsize(p) for p in (path, path + "-wal") if os.path.exists(p))
     try:
@@ -140,7 +162,7 @@ def health(conn, now, db_path=None):
     upcoming = upcoming_settlements(conn, now)
     return {"status": status, "issues": issues, "snap_age": snap_age, "sync": sync, "sync_age": sync_age,
             "cov24": cov24, "cov72": cov72, "venues": venues, "next_settlement": upcoming[0] if upcoming else None,
-            "uptime": now - starts[0] if starts else None, "restarts_24h": restarts_24h,
+            "uptime": now - starts[0] if starts else None, "restarts_24h": restarts_24h, "books": books,
             "db_mb": db_bytes / 2**20, "free_gb": free / 2**30 if free is not None else None}
 
 
@@ -426,8 +448,11 @@ def health_tab(h, warming):
                          ("Late fallbacks, 24h", str(c24["late"]))]),
         ("Hyperliquid, Lighter and RISEx", [("Last sync", f"{age(h['sync_age'])} ago, took {age(took)}")]
          + [(f"{VENUE[x][1]} markets", f"{v[x]['markets']}, {v[x]['gaps']} with gaps") for x in SYNCED]
-         + [("Gaps repaired, last sync", str(repairs))]),
-        ("Server", [("Worker uptime", age(h["uptime"])), ("Restarts, 24h", str(h["restarts_24h"])),
+         + [("Gaps repaired, last sync", str(repairs))]
+         + ([("Order books refreshed", f"{age(int(time.time()) - h['books']['finished_at'])} ago, "
+              f"{json.loads(h['books']['detail'] or '{}').get('markets', 0)} markets")] if h["books"] else [])),
+        ("Server", [("Worker uptime", age(h["uptime"])),
+                    ("Restarts, 24h", f"{h['restarts_24h'][1]} unexpected, {h['restarts_24h'][0]} deploys"),
                     ("Database", f"{h['db_mb']:.0f} MB"),
                     ("Disk free", "n/a" if h["free_gb"] is None else f"{h['free_gb']:.1f} GB")]),
     ]
@@ -960,7 +985,7 @@ function lineChart(el,series,o){if(!el)return;var W=Math.max(300,Math.round(el.c
  var clipped=vals[0]<ymin||vals[vals.length-1]>ymax;
  var X=function(t){return L+(W-L-R)*(t-lo)/(hi-lo)},Y=function(v){v=Math.max(ymin,Math.min(ymax,v));return T+(H-T-B)*(ymax-v)/(ymax-ymin)};
  var step=niceStep((ymax-ymin)/5),dec=step*100>=1?0:(step*100>=.1?1:2),g='';
- for(var v=Math.ceil(ymin/step)*step;v<=ymax+1e-12;v+=step){var yy=Y(v);g+='<line class="grid" x1="'+L+'" x2="'+(W-R)+'" y1="'+yy+'" y2="'+yy+'"/><text class="axis" x="'+(L-8)+'" y="'+(yy+4)+'" text-anchor="end">'+(Math.abs(v)<step/2?'0%':rateTxt(v,dec))+'</text>'}
+ for(var v=Math.ceil(ymin/step)*step;v<=ymax+1e-12;v+=step){var yy=Y(v);g+='<line class="grid" x1="'+L+'" x2="'+(W-R)+'" y1="'+yy+'" y2="'+yy+'"/><text class="axis" x="'+(L-8)+'" y="'+(yy+4)+'" text-anchor="end">'+(o.fmt?o.fmt(Math.abs(v)<step/2?0:v):(Math.abs(v)<step/2?'0%':rateTxt(v,dec)))+'</text>'}
  var span=hi-lo,every=span<=86400?6:(span<=3*86400?12:24),xt='';
  var lastX=-1e9;for(var t=Math.ceil(lo/3600)*3600;t<=hi;t+=3600){var dt=new Date(t*1000),hr=dt.getHours();if(hr%every)continue;var x=X(t);if(x<L+16||x>W-R-16||x-lastX<64)continue;lastX=x;
   xt+='<line class="tick" x1="'+x+'" x2="'+x+'" y1="'+(H-B)+'" y2="'+(H-B+4)+'"/><text class="axis" x="'+x+'" y="'+(H-8)+'" text-anchor="middle">'
@@ -982,7 +1007,7 @@ function lineChart(el,series,o){if(!el)return;var W=Math.max(300,Math.round(el.c
  var svg=$('svg',el),tip=$('.mtip',el),cross=$('.cross',el),cur=null;
  function at(t){cur=t;var cx=X(t),r=svg.getBoundingClientRect();cross.setAttribute('x1',cx);cross.setAttribute('x2',cx);cross.setAttribute('visibility','visible');
   var rows=vis.map(function(s,i){return {s:s,v:maps[i][t]}}).filter(function(x){return x.v!=null}).sort(function(a,b){return b.v-a.v});
-  tip.innerHTML='<div class="tt">'+local(t)+'</div>'+(rows.length?rows.map(function(x){return '<div class="row"><i class="key s'+x.s.slot+'"></i><b>'+rateTxt(x.v,2)+'</b><span>'+esc(x.s.label)+'</span></div>'}).join(''):'<div class="row"><span>No data for this hour</span></div>');
+  tip.innerHTML='<div class="tt">'+local(t)+'</div>'+(rows.length?rows.map(function(x){return '<div class="row"><i class="key s'+x.s.slot+'"></i><b>'+(o.fmt?o.fmt(x.v):rateTxt(x.v,2))+'</b><span>'+esc(x.s.label)+'</span></div>'}).join(''):'<div class="row"><span>No data for this hour</span></div>');
   tip.hidden=false;var px=cx*r.width/W;tip.style.left=px+'px';tip.style.transform=px>r.width*.6?'translateX(calc(-100% - 10px))':'translateX(10px)'}
  function hide(){tip.hidden=true;cross.setAttribute('visibility','hidden')}
  function clampT(t){return Math.min(hi,Math.max(lo+3600,t))}
@@ -996,7 +1021,15 @@ document.addEventListener('click',function(e){
  var ar=e.target.closest('[data-asset]');if(!ar||e.target.closest('th'))return;openAsset(ar.dataset.asset);
  var box=$('#asset-detail');if(box&&box.getBoundingClientRect().top<0)box.scrollIntoView({behavior:'smooth',block:'start'})});
 // volume tab: cheapest delta-neutral round trips, at every size
-var VOL={data:null,size:+(store('vol_size')||0),sort:null,dir:1,open:{}};
+var VOL={data:null,size:+(store('vol_size')||0),sort:null,dir:1,open:{},hist:{}};
+function bpFmt(v){return (Math.abs(v)<10?v.toFixed(1):v.toFixed(0))+' bp'}
+function drawHist(){var size=VOL.size;$$('#vol-body [data-hist]').forEach(function(el){var a=el.dataset.hist,k=a+'|'+size,h=VOL.hist[k];
+ if(h===undefined){VOL.hist[k]=null;fetch('/api/volume/history?a='+encodeURIComponent(a)+'&size='+size).then(function(r){return r.json()})
+  .then(function(d){VOL.hist[k]=d;drawHist()}).catch(function(){VOL.hist[k]={error:1};drawHist()});h=null}
+ if(h===null){el.innerHTML='<p class="muted">Loading history...</p>';return}
+ var first=Math.min.apply(null,(h.series||[]).filter(function(s){return s.points.length}).map(function(s){return s.points[0][0]}));
+ if(h.error||!isFinite(first)){el.innerHTML='<p class="muted">No history yet: it builds up hour by hour.</p>';return}
+ lineChart(el,h.series,{lo:Math.max(h.now-14*86400,first-3600),hi:h.now,f:1e4,fmt:bpFmt,label:'Round-trip cost of '+a+' by venue, in basis points'})})}
 var VCOLS=[['asset','Asset'],['variational','Variational'],['hyperliquid','Hyperliquid'],['lighter','Lighter'],['risex','RISEx'],
  ['pair','Cheapest pair'],['per10k','Per $10k Variational volume'],['usd','Round trip'],['funding','Funding, 1 day held']];
 function bpTxt(x){if(x==null)return null;var b=x*1e4;return b.toFixed(b<10?1:0)+' bp'}
@@ -1037,10 +1070,11 @@ function renderVolume(){var d=VOL.data;if(!d)return;if(d.sizes.indexOf(VOL.size)
    +'<td class="n">'+(b?'<b>'+usdTxt(b.per10k_var)+'</b><span class="sub">'+usdTxt(b.per10k_var_maker)+' with a maker hedge</span>':'')+'</td>'
    +'<td class="n">'+(b?usdTxt(b.usd)+'<span class="sub">'+usdTxt(b.per10k_all)+' per $10k, both venues</span>':'')+'</td>'
    +'<td class="n">'+(f?(f.daily_usd>=0?'+':'')+usdTxt(f.daily_usd)+'<span class="sub">long '+esc(f.long)+', short '+esc(f.short)+'</span>':'<span class="muted">&#8211;</span>')+'</td></tr>';
-  if(VOL.open[a.asset])r+='<tr class="vdet"'+attrs+'><td colspan="9"><p class="note">Cost by size: spread and slippage grow as each leg walks deeper into the book.</p>'+ladder(a,d)+'</td></tr>';
+  if(VOL.open[a.asset])r+='<tr class="vdet"'+attrs+'><td colspan="9"><div class="a-ct"><h4>Round-trip cost at '+sizeTxt(size)+' a leg, by venue</h4><span class="muted">Hourly, up to 14 days. Lower is cheaper.</span></div>'
+   +'<div class="chart" data-hist="'+esc(a.asset)+'"></div><p class="note" style="margin-top:14px">Cost by size right now: spread and slippage grow as each leg walks deeper into the book.</p>'+ladder(a,d)+'</td></tr>';
   return r}).join('');
  $('#vol-body').innerHTML=assets.length?'<div class="tablewrap"><table class="pairs vt"><thead><tr>'+th+'</tr></thead><tbody>'+rows+'</tbody></table></div>':'<p class="empty">No shared assets yet.</p>';
- apply()}
+ apply();drawHist()}
 document.addEventListener('click',function(e){
  var sb=e.target.closest('[data-vsize]');if(sb){VOL.size=+sb.dataset.vsize;store('vol_size',String(VOL.size));renderVolume();return}
  var hc=e.target.closest('[data-vcol]');if(hc){var k=hc.dataset.vcol;VOL.dir=VOL.sort===k?-VOL.dir:1;VOL.sort=k;renderVolume();return}
@@ -1072,6 +1106,11 @@ class _Handler(BaseHTTPRequestHandler):
             conn = connect(self.server.db_path)  # one connection per request: requests run on their own threads
             if url.path in ("/", "/index.html"):
                 self._send(200, build_page(conn, db_path=self.server.db_path).encode(), "text/html; charset=utf-8")
+            elif url.path == "/api/volume/history":
+                q = parse_qs(url.query)
+                d = history(conn, (q.get("a") or [""])[0], float((q.get("size") or ["1000"])[0]))
+                body = json.dumps(d if d is not None else {"error": "This asset is not tracked."})
+                self._send(200 if d is not None else 404, body.encode(), "application/json")
             elif url.path == "/api/volume":
                 self._send(200, json.dumps(payload(conn)).encode(), "application/json")
             elif url.path == "/api/asset":

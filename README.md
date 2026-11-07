@@ -44,7 +44,8 @@ hour, UTC), so a restart never lands on one.
    panel per pair showing its last 7 days hour by hour. Markets (`src/markets.py`) charts every tracked asset's funding
    on each venue and its spread against Variational over 1 to 14 days. Volume (`src/volume.py`) ranks every shared
    asset by the cheapest delta-neutral round trip (both legs' spread, slippage and fees) per $10k of Variational
-   volume, at $1k to $100k a leg, from order books swept hourly after the signals.
+   volume, at $1k to $100k a leg. Order books are refreshed every 10 minutes (Lighter every 20) by their own thread,
+   and each market's hourly cost is kept 30 days for the history chart in each row.
 
 ## Checking Variational estimates against real payments
 
@@ -78,7 +79,9 @@ All settings are environment variables with sensible defaults (`src/config.py`).
 | `VAR_PRE_CAPTURE_S` | `180,90,30` | extra Variational captures before each settlement |
 | `VAR_SNAPSHOT_KEEP_DAYS`, `RUNS_KEEP_DAYS`, `EVENTS_KEEP_DAYS` | `3`, `30`, `30` | data retention |
 | `VOLUME_SIZES` | `1000,...,100000` | USD per leg priced on the Volume tab |
-| `VOLUME_SWEEP`, `VOLUME_SWEEP_MAX_S` | `1`, `900` | hourly order-book sweep for the Volume tab, and its time limit |
+| `VOLUME_SWEEP`, `VOLUME_SWEEP_MAX_S` | `1`, `420` | order-book refresher for the Volume tab, and its time limit per cycle |
+| `BOOKS_INTERVAL_S`, `LIGHTER_BOOKS_EVERY_S` | `600`, `1200` | how often books are refreshed (Lighter shares its 60/min limit) |
+| `COST_HISTORY_KEEP_DAYS` | `30` | days of hourly execution-cost history kept |
 | `DASHBOARD_PORT` | `8765` | dashboard port on the server's localhost |
 
 ## Repository layout

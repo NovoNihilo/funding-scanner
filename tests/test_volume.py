@@ -72,7 +72,7 @@ def test_stale_books_are_left_out(db):
 
 def test_payload_merges_every_size(db, monkeypatch):
     monkeypatch.setattr(volume, "VOLUME_SIZES", [1000.0, 100000.0])
-    db.execute("INSERT INTO runs (job, started_at, finished_at, ok, detail) VALUES ('volume_sweep', ?, ?, 1, ?)",
+    db.execute("INSERT INTO runs (job, started_at, finished_at, ok, detail) VALUES ('books', ?, ?, 1, ?)",
                (NOW - 900, NOW - 300, json.dumps({"markets": 410, "errors": 0, "no_depth": 3})))
     d = volume.payload(db, NOW)
     assert d["sizes"] == [1000, 100000] and [a["asset"] for a in d["assets"]] == ["BBB", "AAA"]

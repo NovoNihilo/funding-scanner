@@ -1,9 +1,12 @@
 """Always-on worker.
 Thread 'var':  Variational snapshot every 5 min (:00:30, :05:30, ...) plus extra captures VAR_PRE_CAPTURE_S seconds
-               before every announced settlement; settlements are derived right after each capture.
+               before every announced settlement; settlements are derived right after each capture. A failed capture
+               is retried within seconds, and retries never run past the next settlement.
 Thread 'sync': at start-up, then hourly at hh:04 -> refresh markets, HL + Lighter + RISEx settled funding (gap repair),
-               costs for candidate pairs, 24h-move stats, signals, housekeeping, timing verdict, then a
-               time-boxed sweep of every shared asset's order books for the Volume tab.
+               costs for candidate pairs, 24h-move stats, signals, housekeeping, timing verdict.
+Thread 'books': every BOOKS_INTERVAL_S (at :02, :12, ...) -> order books of every shared asset for the Volume tab
+               (Lighter every LIGHTER_BOOKS_EVERY_S), time-boxed, then the hourly cost-history row.
+A clean stop (deploy, systemctl) is recorded as 'worker_stop', so Health can tell deploys from crashes.
 Thread 'dash': read-only dashboard on DASHBOARD_HOST:DASHBOARD_PORT (localhost; open it through the SSH tunnel).
 Watchdog: the process exits (systemd restarts it within seconds) if a thread dies, the Variational loop stalls for
 VAR_STALL_S, or one sync runs longer than SYNC_STALL_S."""
@@ -13,15 +16,15 @@ import signal
 import threading
 import time
 
-from src.config import (BACKFILL_DAYS, DASHBOARD_HOST, DASHBOARD_PORT, DB_PATH, VAR_RATE_SOURCE, VOLUME_SWEEP,
-                        VOLUME_SWEEP_MAX_S)
+from src.config import (BACKFILL_DAYS, BOOKS_INTERVAL_S, DASHBOARD_HOST, DASHBOARD_PORT, DB_PATH,
+                        LIGHTER_BOOKS_EVERY_S, VAR_RATE_SOURCE, VOLUME_SWEEP, VOLUME_SWEEP_MAX_S)
 from src.costs import refresh_costs, refresh_price_stats
 from src.dashboard import serve
 from src.db import connect
 from src.funding import (capture_variational, derive_variational, housekeeping, ingest_hyperliquid, ingest_lighter,
                          ingest_risex, next_capture_time, record_run, upcoming_settlements)
 from src.matching import refresh_markets
-from src.volume import sweep_markets
+from src.volume import record_history, sweep_markets
 from src.signals import evaluate_all, market_index, prioritized_assets
 from src.var_timing import timing_report
 
@@ -43,16 +46,21 @@ def wait_for_slot(offset_s, period_s):
 def variational_loop():
     conn = connect()
     due = time.time()  # capture immediately at start-up
+    upcoming = []
     while not STOP.is_set():
         STOP.wait(max(0.0, due - time.time()))
         if STOP.is_set():
             break
         t0 = int(time.time())
+        ahead = [t for t in upcoming if t > t0]
+        give_up = min(ahead) - 3 if ahead and min(ahead) - t0 <= 600 else None  # never capture past a settlement
+        ok = False
         try:
-            n = capture_variational(conn)
+            n = capture_variational(conn, give_up_at=give_up)
             d = derive_variational(conn, lookback_s=12 * 3600)  # recent settlements; older ones are final
             log.info("variational snapshot=%d derived=%d late=%ds", n, d, int(t0 - due))
             record_run(conn, "variational", t0, True, {"snap": n, "derived": d, "late_s": int(t0 - due)})
+            ok = True
         except Exception as e:
             log.exception("variational failed")
             record_run(conn, "variational", t0, False, {"error": repr(e)[:300]})
@@ -63,6 +71,10 @@ def variational_loop():
         except Exception:
             upcoming = []
         due = next_capture_time(now, upcoming)
+        if not ok:  # retry soon, but a retry right on top of a settlement would only capture the next rate
+            nxt = min((t for t in upcoming if t > now), default=None)
+            if nxt is None or nxt - now > 25:
+                due = min(due, now + 20)
 
 
 def sync_loop():
@@ -94,14 +106,33 @@ def sync_loop():
             log.info("costs %s price_stats %s signals %s housekeeping %s", cst, pst, sig, hk)
             record_run(conn, "signals", t0, True, {"costs": cst, "price_stats": pst, "signals": sig, "housekeeping": hk})
             log.info("var timing: %s", timing_report(conn))
-            if VOLUME_SWEEP:
-                vol = refresh_costs(conn, sweep_markets(conn, t0), deadline=time.time() + VOLUME_SWEEP_MAX_S)
-                log.info("volume sweep %s took=%ds", vol, int(time.time()) - t0)
-                record_run(conn, "volume_sweep", t0, vol["errors"] == 0, vol)
         except Exception as e:
             log.exception("sync failed")
             record_run(conn, "sync", t0, False, {"error": repr(e)[:300]})
         BEATS["sync_busy_since"] = None
+
+
+def books_loop():
+    """Volume tab: refresh the order books of every shared asset, oldest first, inside a time limit."""
+    conn = connect()
+    first = True
+    while not STOP.is_set():
+        if not first:
+            wait_for_slot(120, BOOKS_INTERVAL_S)
+            if STOP.is_set():
+                break
+        first = False
+        t0 = int(time.time())
+        try:
+            todo = sweep_markets(conn, t0 - BOOKS_INTERVAL_S + 60,
+                                 {"lighter": t0 - LIGHTER_BOOKS_EVERY_S + 60})
+            st = refresh_costs(conn, todo, deadline=time.time() + VOLUME_SWEEP_MAX_S)
+            st.update(record_history(conn))
+            log.info("books %s took=%ds", st, int(time.time()) - t0)
+            record_run(conn, "books", t0, st["errors"] == 0, st)
+        except Exception as e:
+            log.exception("books failed (collection continues)")
+            record_run(conn, "books", t0, False, {"error": repr(e)[:300]})
 
 
 def dashboard_loop():
@@ -118,6 +149,8 @@ def main():
     conn.close()
     threads = [threading.Thread(target=variational_loop, name="var", daemon=True),
                threading.Thread(target=sync_loop, name="sync", daemon=True)]
+    if VOLUME_SWEEP:
+        threads.append(threading.Thread(target=books_loop, name="books", daemon=True))
     for t in threads:
         t.start()
     threading.Thread(target=dashboard_loop, name="dash", daemon=True).start()  # optional: never restarts the worker
@@ -141,6 +174,12 @@ def main():
                 os._exit(1)
     except KeyboardInterrupt:
         STOP.set()
+    try:  # a clean stop: Health counts the next start as planned (deploy), not as a crash
+        conn = connect()
+        record_run(conn, "worker_stop", int(time.time()), True, {})
+        conn.close()
+    except Exception:
+        pass
     log.info("worker stopped")
 
 

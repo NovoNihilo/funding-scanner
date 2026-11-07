@@ -5,11 +5,12 @@ A round trip = open long on one venue + short on the other, then close both. Its
 round-trip costs (spread + slippage + fees, from book_costs). Entry basis is NOT counted: a quick round trip
 closes at roughly the same cross-venue basis it opened at. Cost is quoted per $10k of Variational volume
 (each round trip trades 2 x size on Variational) and per $10k of total volume across both venues (4 x size).
-Funding is shown alongside, for the better direction, as what holding the hedge for a day would earn or pay."""
+Funding is shown alongside, for the better direction, as what holding the hedge for a day would earn or pay.
+History: the last refresh of every hour is kept per market (cost_history, COST_HISTORY_KEEP_DAYS) for charts."""
 import json
 import time
 
-from src.config import REQUIRED_VENUE, VOLUME_MAX_AGE_S, VOLUME_SIZES
+from src.config import COST_HISTORY_KEEP_DAYS, REQUIRED_VENUE, VOLUME_MAX_AGE_S, VOLUME_SIZES
 from src.markets import SHORT, describe
 
 HOUR = 3600
@@ -36,13 +37,14 @@ def _shared(conn):
     return out
 
 
-def sweep_markets(conn, fresh_since):
-    """Markets of shared assets whose order-book costs were not refreshed since `fresh_since`, oldest first
-    (Variational first: its costs come from stored quotes and need no request)."""
+def sweep_markets(conn, fresh_since, venue_fresh=None):
+    """Markets of shared assets whose order-book costs were not refreshed since `fresh_since` (or, per venue,
+    venue_fresh[venue]), oldest first (Variational first: its costs come from stored quotes, no request needed)."""
+    venue_fresh = venue_fresh or {}
     last = {(r[0], r[1]): r[2] for r in conn.execute(
         "SELECT venue, symbol, MIN(captured_at) FROM book_costs GROUP BY venue, symbol")}  # any stale size
     todo = [(m["venue"], m["symbol"], m["market_id"]) for ms in _shared(conn).values() for m in ms
-            if (last.get((m["venue"], m["symbol"])) or 0) < fresh_since]
+            if (last.get((m["venue"], m["symbol"])) or 0) < venue_fresh.get(m["venue"], fresh_since)]
     return sorted(todo, key=lambda x: (x[0] != "variational", last.get((x[0], x[1])) or 0, x[0], x[1]))
 
 
@@ -160,8 +162,47 @@ def payload(conn, now=None):
         a = assets[name]
         a["venues"] = sorted(a["venues"].values(), key=lambda v: (SLOT_ORDER.get(v["venue"], 9), v["symbol"]))
         out.append(a)
-    sweep = conn.execute("SELECT started_at, finished_at, detail FROM runs WHERE job='volume_sweep' "
+    sweep = conn.execute("SELECT started_at, finished_at, detail FROM runs WHERE job='books' "
                          "ORDER BY id DESC LIMIT 1").fetchone()
     return {"now": now, "sizes": sizes, "assets": out,
             "sweep": None if sweep is None else {"finished_at": sweep["finished_at"],
                                                  **json.loads(sweep["detail"] or "{}")}}
+
+
+def record_history(conn, now=None):
+    """Copy every shared market's current costs into this hour's cost_history row (the hour's last refresh wins),
+    then prune rows older than COST_HISTORY_KEEP_DAYS. About 660 small rows per hour (~1 MB a day)."""
+    now = int(now or time.time())
+    hour = now // HOUR * HOUR
+    shared = {(m["venue"], m["symbol"]) for ms in _shared(conn).values() for m in ms}
+    rows = {}
+    for r in conn.execute("SELECT venue, symbol, size_usd, rt_cost FROM book_costs WHERE captured_at >= ?",
+                          (now - VOLUME_MAX_AGE_S,)):
+        if (r[0], r[1]) in shared and r[3] is not None:
+            rows.setdefault((r[0], r[1]), {})[str(int(r[2]))] = float(f"{r[3]:.4g}")
+    with conn:
+        conn.executemany("INSERT OR REPLACE INTO cost_history VALUES (?,?,?,?)",
+                         [(v, s, hour, json.dumps(c, separators=(",", ":"))) for (v, s), c in rows.items()])
+        pruned = conn.execute("DELETE FROM cost_history WHERE hour < ?",
+                              (now - int(COST_HISTORY_KEEP_DAYS * 86400),)).rowcount
+    return {"history_rows": len(rows), "history_pruned": pruned}
+
+
+def history(conn, asset, size, days=14, now=None):
+    """Hourly round-trip cost of each of an asset's shared markets at `size`, for the Volume tab chart."""
+    now = int(now or time.time())
+    ms = _shared(conn).get(asset)
+    if not ms:
+        return None
+    key, series = str(int(size)), []
+    for m in sorted(ms, key=lambda m: (SLOT_ORDER.get(m["venue"], 9), m["symbol"])):
+        k, label, short, slot = describe(m["venue"], m["symbol"])
+        pts = []
+        for hour, costs in conn.execute("SELECT hour, costs FROM cost_history WHERE venue=? AND symbol=? AND hour>? "
+                                        "ORDER BY hour", (m["venue"], m["symbol"], now - days * 86400)):
+            v = json.loads(costs).get(key)
+            if v is not None:
+                pts.append([hour, v])
+        series.append({"key": k, "venue": m["venue"], "symbol": m["symbol"], "label": label, "short": short,
+                       "slot": slot, "points": pts})
+    return {"asset": asset, "size": int(size), "now": now // HOUR * HOUR, "days": days, "series": series}

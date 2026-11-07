@@ -49,9 +49,14 @@ HOLD_HORIZON_H = float(os.environ.get("HOLD_HORIZON_H", "168"))  # ranking: expe
 PAYBACK_FAST_H = float(os.environ.get("PAYBACK_FAST_H", "24"))  # payback label thresholds
 PAYBACK_OK_H = float(os.environ.get("PAYBACK_OK_H", "72"))
 COST_MAX_AGE_S = int(os.environ.get("COST_MAX_AGE_S", "7200"))  # older cost estimates count as missing
-# Volume tab: hourly sweep of every shared asset's order books, after signals (time-boxed, oldest first)
+# Volume tab: a separate thread refreshes every shared asset's order books (time-boxed, oldest first).
+# Hyperliquid and RISEx books every BOOKS_INTERVAL_S; Lighter (60 requests/min, shared with the hourly sync) every
+# LIGHTER_BOOKS_EVERY_S. Variational costs come from its 5-minute snapshots. Hourly cost history kept 30 days.
 VOLUME_SWEEP = os.environ.get("VOLUME_SWEEP", "1") == "1"
-VOLUME_SWEEP_MAX_S = int(os.environ.get("VOLUME_SWEEP_MAX_S", "900"))
+VOLUME_SWEEP_MAX_S = int(os.environ.get("VOLUME_SWEEP_MAX_S", "420"))  # time limit per refresh cycle
+BOOKS_INTERVAL_S = int(os.environ.get("BOOKS_INTERVAL_S", "600"))
+LIGHTER_BOOKS_EVERY_S = int(os.environ.get("LIGHTER_BOOKS_EVERY_S", "1200"))
+COST_HISTORY_KEEP_DAYS = float(os.environ.get("COST_HISTORY_KEEP_DAYS", "30"))
 VOLUME_MAX_AGE_S = int(os.environ.get("VOLUME_MAX_AGE_S", "7200"))  # older books are left out of the ranking
 VOLUME_SIZES = [float(x) for x in os.environ.get("VOLUME_SIZES", "1000,5000,10000,25000,50000,100000").split(",")]
 BOOK_SIZES = sorted(set(COST_SIZES) | set(VOLUME_SIZES))  # every size a fetched book is walked at

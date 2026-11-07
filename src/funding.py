@@ -208,12 +208,12 @@ def next_capture_time(now, upcoming, period=300, offset=30, pre_offsets=None):
     return min([regular] + extra)
 
 
-def capture_variational(conn, now=None):
-    """Store one snapshot of funding + quotes for matched Variational perps."""
+def capture_variational(conn, now=None, give_up_at=None):
+    """Store one snapshot of funding + quotes for matched Variational perps (retrying until give_up_at)."""
     now = int(now or time.time())
     matched = {r["symbol"] for r in matched_markets(conn, "variational")}
     rows = []
-    for x in va.stats()["listings"]:
+    for x in va.stats(give_up_at=give_up_at)["listings"]:
         f = x.get("funding")
         if x["ticker"] not in matched or x.get("contract_type") != "perpetual" or not f or not f.get("last"):
             continue

@@ -1,6 +1,7 @@
 """RISEx public REST API (no auth; docs: developer.rise.trade). Limit 500 requests / 10 s per IP (paced here).
 All timestamps are nanoseconds. Funding settles hourly: 'funding_rate' is a signed fraction of notional per hour,
 positive = longs pay shorts (verified: funding_rate_8h = 8 x current_funding_rate; payment = rate x size)."""
+import threading
 import time
 
 from src.http_client import request_json
@@ -9,13 +10,15 @@ BASE = "https://api.rise.trade/v1"
 NS = 10 ** 9
 _MIN_GAP_S = 0.05
 _last_call = [0.0]
+_PACE = threading.Lock()
 
 
 def _get(path, params=None):
-    wait = _last_call[0] + _MIN_GAP_S - time.time()
-    if wait > 0:
-        time.sleep(wait)
-    _last_call[0] = time.time()
+    with _PACE:  # one shared limiter for every thread
+        wait = _last_call[0] + _MIN_GAP_S - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _last_call[0] = time.time()
     return request_json("GET", f"{BASE}/{path}", params=params)
 
 

@@ -122,6 +122,15 @@ CREATE TABLE IF NOT EXISTS book_costs (
     PRIMARY KEY (venue, symbol, size_usd)
 );
 
+-- hourly execution-cost history (Volume tab): last refresh of each hour, {size_usd: round-trip cost} as JSON
+CREATE TABLE IF NOT EXISTS cost_history (
+    venue TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    hour INTEGER NOT NULL,
+    costs TEXT NOT NULL,
+    PRIMARY KEY (venue, symbol, hour)
+);
+
 -- 99th percentile absolute 24h price move, for the leverage stress test
 CREATE TABLE IF NOT EXISTS price_stats (
     asset TEXT PRIMARY KEY,

@@ -1,5 +1,6 @@
 """Lighter public REST API (no auth). Unauthenticated limit: 60 requests/min (throttled here).
 Funding rows: rate = percent/hour rounded to 4dp; value = USD per contract unit; direction 'long' = longs pay."""
+import threading
 import time
 
 from src.http_client import request_json
@@ -7,14 +8,16 @@ from src.http_client import request_json
 BASE = "https://mainnet.zklighter.elliot.ai/api/v1"
 _MIN_GAP_S = 1.05
 _last_call = [0.0]
+_PACE = threading.Lock()
 _candle_ms = [None]  # learned: does /candles take ms timestamps?
 
 
 def _get(path, params=None):
-    wait = _last_call[0] + _MIN_GAP_S - time.time()
-    if wait > 0:
-        time.sleep(wait)
-    _last_call[0] = time.time()
+    with _PACE:  # one shared limiter for every thread
+        wait = _last_call[0] + _MIN_GAP_S - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _last_call[0] = time.time()
     return request_json("GET", f"{BASE}/{path}", params=params)
 
 
